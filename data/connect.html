@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MicroLink - Connect Station</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>MICROLINK</h1>
+            <p class="subtitle">ESP32-C6 EchoLink Node</p>
+        </header>
+
+        <nav>
+            <a href="/">Status</a>
+            <a href="/connect.html" class="active">Connect</a>
+            <a href="/settings.html">Settings</a>
+        </nav>
+
+        <div id="alertBox" class="alert"></div>
+
+        <div class="card">
+            <h2 class="card-title">Connect EchoLink Station</h2>
+            <div class="form-group">
+                <label for="target_node">Node Number</label>
+                <input type="number" id="target_node" placeholder="e.g. 9999 or 123456">
+            </div>
+            <div class="form-group">
+                <label for="target_call">Callsign (Optional)</label>
+                <input type="text" id="target_call" placeholder="e.g. *ECHOTEST*">
+            </div>
+            <div style="display:flex; gap:10px; margin-top:14px;">
+                <button class="btn btn-primary" onclick="connectStation(document.getElementById('target_node').value, document.getElementById('target_call').value)">Connect</button>
+                <button class="btn btn-danger" onclick="disconnectStation()">Disconnect</button>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2 class="card-title">Saved Favorites & Conferences</h2>
+            <div id="favorites_list">Loading favorites...</div>
+
+            <form id="add_fav_form" onsubmit="addFavorite(event)" style="margin-top:16px; border-top:1px solid var(--border); padding-top:12px;">
+                <h3 style="font-size:0.9rem; color:var(--text-muted); margin-bottom:8px;">Add New Favorite</h3>
+                <div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px;">
+                    <input type="number" id="fav_node" placeholder="Node #" required>
+                    <input type="text" id="fav_call" placeholder="Callsign" required>
+                </div>
+                <div style="margin-top:8px;">
+                    <input type="text" id="fav_desc" placeholder="Description (e.g. Bangkok Repeater)">
+                </div>
+                <button type="submit" class="btn btn-primary" style="margin-top:10px; padding:8px;">+ Save to Favorites</button>
+            </form>
+        </div>
+    </div>
+
+    <script src="/app.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            loadFavorites();
+            updateStatus();
+            statusTimer = setInterval(updateStatus, 2000);
+        });
+    </script>
+</body>
+</html>
+

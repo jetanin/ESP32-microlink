@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MicroLink - Settings</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>MICROLINK</h1>
+            <p class="subtitle">ESP32-C6 EchoLink Node</p>
+        </header>
+
+        <nav>
+            <a href="/">Status</a>
+            <a href="/connect.html">Connect</a>
+            <a href="/settings.html" class="active">Settings</a>
+        </nav>
+
+        <div id="alertBox" class="alert"></div>
+
+        <form onsubmit="saveSettings(event)">
+            <div class="card">
+                <h2 class="card-title">WiFi Configuration</h2>
+                <div class="form-group">
+                    <label for="wifi_ssid">WiFi SSID (Network Name)</label>
+                    <input type="text" id="wifi_ssid" required>
+                </div>
+                <div class="form-group">
+                    <label for="wifi_pass">WiFi Password</label>
+                    <input type="password" id="wifi_pass" placeholder="Leave blank to keep existing">
+                </div>
+            </div>
+
+            <div class="card">
+                <h2 class="card-title">EchoLink Station Identity</h2>
+                <div class="form-group">
+                    <label for="callsign">Station Callsign (e.g. HS1ABC-L / E29XYZ-R)</label>
+                    <input type="text" id="callsign" required>
+                </div>
+                <div class="form-group">
+                    <label for="el_password">EchoLink Password</label>
+                    <input type="password" id="el_password" placeholder="Leave blank to keep existing">
+                </div>
+                <div class="form-group">
+                    <label for="station_name">Sysop / Station Name</label>
+                    <input type="text" id="station_name">
+                </div>
+                <div class="form-group">
+                    <label for="location">Location / QTH / Freq</label>
+                    <input type="text" id="location">
+                </div>
+            </div>
+
+            <div class="card">
+                <h2 class="card-title">EchoLink Proxy (Public / NAT Bypass)</h2>
+                <div class="form-group">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="proxy_enabled" onchange="toggleProxyFields()" style="width:auto;margin:0;">
+                        <span>Enable EchoLink Proxy</span>
+                    </label>
+                    <p style="font-size:0.75rem;color:#8899a6;margin-top:4px;">
+                        Bypasses firewalls and CGNAT (4G/5G mobile hotspot, hotel/dorm Wi-Fi) without port forwarding.
+                    </p>
+                </div>
+                <div id="proxy_fields" style="display:none;">
+                    <div class="form-group">
+                        <label for="public_proxy_sel">Quick Select Public Proxy</label>
+                        <select id="public_proxy_sel" onchange="onSelectPublicProxy(this.value)">
+                            <option value="">-- Custom or Select Public Proxy --</option>
+                            <option value="154.64.217.174:8100">WP4CL4 (154.64.217.174:8100) - Ready</option>
+                            <option value="44.76.15.47:8100">WX5FWD-47 (44.76.15.47:8100) - Ready</option>
+                            <option value="154.64.217.180:8100">WP4CL10 (154.64.217.180:8100)</option>
+                            <option value="172.105.105.151:8100">E25ZDO Asia/Thailand (172.105.105.151:8100)</option>
+                            <option value="139.162.58.118:8100">JA1ZLO Japan (139.162.58.118:8100)</option>
+                            <option value="45.79.147.214:8100">US East (45.79.147.214:8100)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="proxy_host">Proxy Server Host / IP</label>
+                        <input type="text" id="proxy_host" placeholder="e.g. 154.64.217.174">
+                    </div>
+                    <div class="form-group">
+                        <label for="proxy_port">Proxy Port</label>
+                        <input type="number" id="proxy_port" placeholder="8100" value="8100">
+                    </div>
+                    <div class="form-group">
+                        <label for="proxy_password">Proxy Password</label>
+                        <input type="password" id="proxy_password" placeholder="Leave blank for default PUBLIC">
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2 class="card-title">Web Administration Security</h2>
+                <div class="form-group">
+                    <label for="web_user">Admin Username</label>
+                    <input type="text" id="web_user" required>
+                </div>
+                <div class="form-group">
+                    <label for="web_pass">Admin Password</label>
+                    <input type="password" id="web_pass" placeholder="Leave blank to keep existing">
+                </div>
+            </div>
+
+            <button type="submit" class="btn btn-primary" style="margin-bottom:24px;">Save Configuration</button>
+        </form>
+    </div>
+
+    <script src="/app.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            loadSettings();
+        });
+    </script>
+</body>
+</html>
+

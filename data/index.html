@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MicroLink - Live Status</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>MICROLINK</h1>
+            <p class="subtitle">ESP32-C6 EchoLink Node</p>
+        </header>
+
+        <nav>
+            <a href="/" class="active">Status</a>
+            <a href="/connect.html">Connect</a>
+            <a href="/settings.html">Settings</a>
+        </nav>
+
+        <div id="alertBox" class="alert"></div>
+
+        <div class="card">
+            <h2 class="card-title">Live System Status</h2>
+            <div class="status-grid">
+                <div class="status-item">
+                    <div class="status-label">WiFi Network</div>
+                    <div id="st_wifi" class="status-value">Connecting...</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">EchoLink Status</div>
+                    <div id="st_echolink" class="status-value badge badge-warning">CHECKING</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">Connected Station</div>
+                    <div id="st_station" class="status-value">IDLE</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">Transmitter (TX)</div>
+                    <div id="st_tx" class="status-value badge badge-info">IDLE</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">Receiver (RX)</div>
+                    <div id="st_rx" class="status-value badge badge-info">IDLE</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">Free Heap RAM</div>
+                    <div id="st_heap" class="status-value">---</div>
+                </div>
+            </div>
+
+            <div class="meter-box" style="margin-top:16px;">
+                <div class="status-label">Microphone Input Level (KY-038)</div>
+                <div class="meter-bar" style="margin-top:6px;">
+                    <div id="mic_fill" class="meter-fill"></div>
+                </div>
+                <p id="mic_val" style="font-size:0.75rem; color:var(--text-muted); margin-top:4px;">Raw: 2048 (0%)</p>
+            </div>
+
+            <div class="meter-box" style="margin-top:14px;">
+                <div class="status-label">Receiver Audio Level (RX)</div>
+                <div class="meter-bar" style="margin-top:6px;">
+                    <div id="rx_fill" class="meter-fill" style="background:#28a745;"></div>
+                </div>
+                <p id="rx_val" style="font-size:0.75rem; color:var(--text-muted); margin-top:4px;">Peak: 0 (0%)</p>
+            </div>
+
+            <div style="margin-top:16px; font-size:0.8rem; color:var(--text-muted); text-align:right;">
+                Uptime: <span id="st_uptime">0h 0m 0s</span>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2 class="card-title">Audio Pipeline & Jitter Buffer (8 kHz)</h2>
+            <div class="status-grid">
+                <div class="status-item">
+                    <div class="status-label">Jitter Buffer Depth</div>
+                    <div id="jb_depth" class="status-value">0 frames (0 ms)</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">Underflows / Drops</div>
+                    <div id="jb_errors" class="status-value">0 / 0</div>
+                </div>
+            </div>
+            <div style="margin-top:14px;">
+                <button id="btn_loopback" class="btn btn-primary" onclick="toggleLoopback()">Start Real-time Loopback Test</button>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2 class="card-title">Audio Pipeline & Jitter Buffer (8 kHz)</h2>
+            <div class="status-grid">
+                <div class="status-item">
+                    <div class="status-label">Jitter Buffer Depth</div>
+                    <div id="jb_depth" class="status-value">0 frames (0 ms)</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">Underflows / Drops</div>
+                    <div id="jb_errors" class="status-value">0 / 0</div>
+                </div>
+            </div>
+            <div style="margin-top:14px;">
+                <button id="btn_loopback" class="btn btn-primary" onclick="toggleLoopback()">Start Real-time Loopback Test</button>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2 class="card-title">Audio Pipeline & Jitter Buffer (8 kHz)</h2>
+            <div class="status-grid">
+                <div class="status-item">
+                    <div class="status-label">Jitter Buffer Depth</div>
+                    <div id="jb_depth" class="status-value">0 frames (0 ms)</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">Underflows / Drops</div>
+                    <div id="jb_errors" class="status-value">0 / 0</div>
+                </div>
+            </div>
+            <div style="margin-top:14px;">
+                <button id="btn_loopback" class="btn btn-primary" onclick="toggleLoopback()">Start Real-time Loopback Test</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/app.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            updateStatus();
+            statusTimer = setInterval(updateStatus, 1000);
+        });
+    </script>
+</body>
+</html>
+
