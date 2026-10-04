@@ -36,6 +36,11 @@ void config_manager_init()
     String p_host = s_prefs_config.getString("proxy_host", "");
     uint16_t p_port = s_prefs_config.getUShort("proxy_port", 8100);
     String p_pass = s_prefs_config.getString("proxy_pass", "PUBLIC");
+    uint8_t vox_pre = s_prefs_config.getUChar("vox_pre", 3);
+    if (vox_pre > 6)
+    {
+        vox_pre = 3;
+    }
 
     strncpy(s_cached_config.wifi_ssid, ssid.c_str(), sizeof(s_cached_config.wifi_ssid) - 1);
     strncpy(s_cached_config.wifi_pass, pass.c_str(), sizeof(s_cached_config.wifi_pass) - 1);
@@ -49,6 +54,7 @@ void config_manager_init()
     strncpy(s_cached_config.proxy_host, p_host.c_str(), sizeof(s_cached_config.proxy_host) - 1);
     s_cached_config.proxy_port = (p_port > 0) ? p_port : 8100;
     strncpy(s_cached_config.proxy_password, p_pass.c_str(), sizeof(s_cached_config.proxy_password) - 1);
+    s_cached_config.vox_pre = vox_pre;
 
     s_prefs_config.end();
 
@@ -124,8 +130,30 @@ bool config_manager_save(const ConfigData &new_cfg)
         s_prefs_config.putString("proxy_pass", s_cached_config.proxy_password);
     }
 
+    if (new_cfg.vox_pre <= 6)
+    {
+        s_cached_config.vox_pre = new_cfg.vox_pre;
+        s_prefs_config.putUChar("vox_pre", s_cached_config.vox_pre);
+    }
+
     s_prefs_config.end();
     return true;
+}
+
+bool config_manager_set_vox_preroll(uint8_t frames)
+{
+    if (frames > 6)
+        return false;
+    s_cached_config.vox_pre = frames;
+    s_prefs_config.begin("ml_config", false);
+    s_prefs_config.putUChar("vox_pre", frames);
+    s_prefs_config.end();
+    return true;
+}
+
+uint8_t config_manager_get_vox_preroll()
+{
+    return s_cached_config.vox_pre;
 }
 
 String config_manager_get_favorites()

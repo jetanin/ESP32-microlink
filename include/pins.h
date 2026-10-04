@@ -54,6 +54,13 @@ constexpr int PIN_LED_RX        = 22; // RX active (receiving audio from remote 
 // Active LOW, requires internal pull-up enabled (INPUT_PULLUP)
 constexpr int PIN_BUTTON_PTT    = 2;
 
+// Potentiometer for VOX sensitivity (ADC1 Channel 3 on GPIO 3)
+constexpr int PIN_POT_VOX_SENS  = 3;
+
+// VOX mode switch (Slide switch / Toggle switch, Active LOW with INPUT_PULLUP on GPIO 23)
+// LOW = VOX mode, HIGH = PTT mode
+constexpr int PIN_SWITCH_VOX    = 23;
+
 // =============================================================================
 // Optional I2C Display (SSD1306 OLED 128x64)
 // =============================================================================

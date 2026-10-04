@@ -132,6 +132,7 @@ static void echolink_task(void *pvParameters)
                     }
                     s_next_logon_attempt = now + 30000;
                     system_state_set_echolink(EchoLinkState::AUTH_FAILED);
+                    system_state_set_reg_failed(true);
                 }
                 else
                 {
@@ -150,12 +151,14 @@ static void echolink_task(void *pvParameters)
                         s_last_logon_time = now;
                         s_next_logon_attempt = now + LOGON_INTERVAL_MS;
                         system_state_set_echolink(EchoLinkState::LOGGED_IN);
+                        system_state_set_reg_failed(false);
                         Serial.println(F("[EchoLink] Registered with EchoLink directory"));
                     }
                     else
                     {
                         s_next_logon_attempt = now + 30000; // Backoff 30 seconds
                         system_state_set_echolink(EchoLinkState::AUTH_FAILED);
+                        system_state_set_reg_failed(true);
                         Serial.println(F("[EchoLink] Addressing server registration failed (retrying in 30s)"));
                     }
                 }
@@ -373,6 +376,7 @@ void echolink_client_trigger_registration()
 {
     s_force_registration = true;
     s_next_logon_attempt = 0;
+    system_state_set_reg_failed(false);
 }
 
 bool echolink_client_is_registered()
@@ -1165,6 +1169,12 @@ static void service_tx_audio()
             s_tx_pcm_samples_accum = 0;
             system_state_set_ptt(true);
             Serial.printf("[EchoLink] TX activated (Source: %u) - transmitting audio\n", (unsigned int)s_tx_source);
+            if (s_tx_source == TxSource::VOX)
+            {
+                uint8_t pre_frames = audio_pipeline_get_vox_preroll_delay();
+                Serial.printf("[EchoLink] VOX TX started: sending %u pre-roll frames (%u ms) first\n",
+                              pre_frames, (unsigned int)(pre_frames * 20));
+            }
         }
 
         // While an announcement is going out, ignore the microphone (mute mic path into TX)
@@ -1217,6 +1227,7 @@ static void service_tx_audio()
             s_tx_active = false;
             s_tx_source = TxSource::NONE;
             system_state_set_ptt(false);
+            audio_pipeline_clear_tx();
             Serial.println("[EchoLink] PTT released - transmission ended");
 
             // Flush remaining partial audio buffer if any (zero pad to full 640-sample bundle)

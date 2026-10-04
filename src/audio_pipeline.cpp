@@ -2,6 +2,7 @@
 #include "system_state.h"
 #include "dtmf_detector.h"
 #include "announcer.h"
+#include "echolink_client.h"
 #include <cmath>
 
 static constexpr UBaseType_t TASK_PRIO_AUDIO_PLAYOUT = 5; // Highest system priority
@@ -13,12 +14,22 @@ AudioPipeline::AudioPipeline(AudioIn &audio_in, AudioOut &audio_out)
     : m_audio_in(audio_in),
       m_audio_out(audio_out),
       m_jitter_buffer(4), // Pre-buffer 4 frames (80 ms) — matches 1 EchoLink packet exactly
+      m_vox_pre_roll(3),
+      m_req_preroll_delay(3),
+      m_delay_change_pending(false),
+      m_reset_pending(false),
+      m_tx_fifo_head(0),
+      m_tx_fifo_tail(0),
+      m_tx_fifo_count(0),
+      m_tx_fifo_mutex(nullptr),
       m_mode(PipelineMode::IDLE),
       m_playout_task_handle(nullptr),
       m_capture_task_handle(nullptr),
       m_initialized(false),
       m_rx_seq(0)
 {
+    memset(m_tx_fifo_buf, 0, sizeof(m_tx_fifo_buf));
+    m_tx_fifo_mutex = xSemaphoreCreateMutex();
     s_instance = this;
 }
 
@@ -34,6 +45,11 @@ AudioPipeline::~AudioPipeline()
     {
         vTaskDelete(m_capture_task_handle);
         m_capture_task_handle = nullptr;
+    }
+    if (m_tx_fifo_mutex)
+    {
+        vSemaphoreDelete(m_tx_fifo_mutex);
+        m_tx_fifo_mutex = nullptr;
     }
     s_instance = nullptr;
 }
@@ -137,19 +153,93 @@ void AudioPipeline::write_frame(const int16_t *pcm160)
 
 bool AudioPipeline::read_frame(int16_t *pcm160, uint32_t wait_ms)
 {
-    size_t got = m_audio_in.read_samples(pcm160, AUDIO_FRAME_SAMPLES, pdMS_TO_TICKS(wait_ms));
+    size_t got = read_samples(pcm160, AUDIO_FRAME_SAMPLES, wait_ms);
     return (got == AUDIO_FRAME_SAMPLES);
 }
 
 size_t AudioPipeline::read_samples(int16_t *dest, size_t count, uint32_t wait_ms)
 {
-    return m_audio_in.read_samples(dest, count, pdMS_TO_TICKS(wait_ms));
+    (void)wait_ms;
+    return tx_fifo_read(dest, count);
 }
 
 void AudioPipeline::clear()
 {
     m_jitter_buffer.reset();
     m_rx_seq = 0;
+    tx_fifo_clear();
+    request_vox_reset();
+}
+
+void AudioPipeline::clear_tx()
+{
+    tx_fifo_clear();
+}
+
+void AudioPipeline::set_vox_preroll_delay(uint8_t delay_frames)
+{
+    m_req_preroll_delay.store(delay_frames);
+    m_delay_change_pending.store(true);
+}
+
+uint8_t AudioPipeline::get_vox_preroll_delay() const
+{
+    return m_vox_pre_roll.getDelayFrames();
+}
+
+void AudioPipeline::request_vox_reset()
+{
+    m_reset_pending.store(true);
+}
+
+bool AudioPipeline::tx_fifo_write(const int16_t *samples, size_t count)
+{
+    if (!samples || count == 0) return true;
+    if (!m_tx_fifo_mutex || xSemaphoreTake(m_tx_fifo_mutex, pdMS_TO_TICKS(10)) != pdTRUE) return false;
+
+    if (TX_FIFO_CAPACITY - m_tx_fifo_count < count)
+    {
+        xSemaphoreGive(m_tx_fifo_mutex);
+        return false;
+    }
+
+    for (size_t i = 0; i < count; ++i)
+    {
+        m_tx_fifo_buf[m_tx_fifo_head] = samples[i];
+        m_tx_fifo_head = (m_tx_fifo_head + 1) % TX_FIFO_CAPACITY;
+    }
+    m_tx_fifo_count += count;
+
+    xSemaphoreGive(m_tx_fifo_mutex);
+    return true;
+}
+
+size_t AudioPipeline::tx_fifo_read(int16_t *dest, size_t count)
+{
+    if (!dest || count == 0) return 0;
+    if (!m_tx_fifo_mutex || xSemaphoreTake(m_tx_fifo_mutex, pdMS_TO_TICKS(10)) != pdTRUE) return 0;
+
+    size_t to_read = (count < m_tx_fifo_count) ? count : m_tx_fifo_count;
+    for (size_t i = 0; i < to_read; ++i)
+    {
+        dest[i] = m_tx_fifo_buf[m_tx_fifo_tail];
+        m_tx_fifo_tail = (m_tx_fifo_tail + 1) % TX_FIFO_CAPACITY;
+    }
+    m_tx_fifo_count -= to_read;
+
+    xSemaphoreGive(m_tx_fifo_mutex);
+    return to_read;
+}
+
+void AudioPipeline::tx_fifo_clear()
+{
+    if (m_tx_fifo_mutex && xSemaphoreTake(m_tx_fifo_mutex, pdMS_TO_TICKS(10)) == pdTRUE)
+    {
+        m_tx_fifo_head = 0;
+        m_tx_fifo_tail = 0;
+        m_tx_fifo_count = 0;
+        xSemaphoreGive(m_tx_fifo_mutex);
+    }
 }
 
 void AudioPipeline::audio_playout_task(void *pvParameters)
@@ -160,7 +250,7 @@ void AudioPipeline::audio_playout_task(void *pvParameters)
 
     for (;;)
     {
-            PipelineMode mode = pipeline->m_mode;
+        PipelineMode mode = pipeline->m_mode;
 
         if (mode == PipelineMode::LOOPBACK || mode == PipelineMode::NETWORK)
         {
@@ -192,6 +282,17 @@ void AudioPipeline::audio_capture_task(void *pvParameters)
 
     for (;;)
     {
+        // 1. Process atomic delay updates and atomic reset requests at frame boundary
+        if (pipeline->m_delay_change_pending.exchange(false))
+        {
+            uint8_t d = pipeline->m_req_preroll_delay.load();
+            pipeline->m_vox_pre_roll.setDelayFrames(d);
+        }
+        if (pipeline->m_reset_pending.exchange(false))
+        {
+            pipeline->m_vox_pre_roll.reset();
+        }
+
         if (pipeline->m_mode == PipelineMode::LOOPBACK)
         {
             // Read exactly 160 samples (20 ms) from ADC continuous DMA
@@ -205,23 +306,62 @@ void AudioPipeline::audio_capture_task(void *pvParameters)
         }
         else
         {
-            // Sample for VU meter metrics and DTMF detection when NOT transmitting
-            SystemState st = system_state_get();
-            if (!st.tx_active)
+            // Read 160 samples (20 ms @ 8 kHz) from ADC continuous DMA
+            int16_t mic_frame[AUDIO_FRAME_SAMPLES];
+            size_t read_cnt = pipeline->m_audio_in.read_samples(mic_frame, AUDIO_FRAME_SAMPLES, pdMS_TO_TICKS(50));
+            if (read_cnt == AUDIO_FRAME_SAMPLES)
             {
-                int16_t dummy[AUDIO_FRAME_SAMPLES];
-                size_t read_cnt = pipeline->m_audio_in.read_samples(dummy, AUDIO_FRAME_SAMPLES, pdMS_TO_TICKS(50));
-                if (read_cnt > 0)
+                SystemState st = system_state_get();
+
+                // Process DTMF if not transmitting and announcer not busy/inhibited
+                if (!st.tx_active && !announcer_is_vox_inhibited())
                 {
-                    // Gate DTMF when announcer is busy or in post-announcement inhibit window
-                    // (prevents mic bleed and speaker echo from self-triggering detector)
-                    if (!Announcer::instance().is_vox_inhibited())
+                    dtmf_detector_process(mic_frame, AUDIO_FRAME_SAMPLES);
+                }
+
+                bool is_vox = (st.op_mode == 1);
+                bool tx_active = echolink_client_is_tx_active();
+                TxSource tx_src = echolink_client_get_tx_source();
+
+                // Announcements mute the live microphone path into TX
+                if (tx_src == TxSource::ANNOUNCEMENT)
+                {
+                    continue;
+                }
+
+                if (is_vox)
+                {
+                    // VOX Mode: push newest frame into VoxPreRoll delay line
+                    int16_t delayed_frame[AUDIO_FRAME_SAMPLES];
+                    bool primed = pipeline->m_vox_pre_roll.push(mic_frame, delayed_frame);
+
+                    if (tx_active && (tx_src == TxSource::VOX))
                     {
-                        dtmf_detector_process(dummy, read_cnt);
+                        // Once VOX is open, write delayed frame to TX FIFO (skip if not primed yet)
+                        if (primed)
+                        {
+                            pipeline->tx_fifo_write(delayed_frame, AUDIO_FRAME_SAMPLES);
+                        }
+                    }
+                    else
+                    {
+                        // While VOX is closed, frames only circulate in pre-roll buffer.
+                        // Leftover frames when VOX closes are post-speech silence and discarded.
+                    }
+                }
+                else
+                {
+                    // PTT Mode: bypass pre-roll buffer completely (0 added latency)
+                    if (tx_active && (tx_src == TxSource::PTT_BUTTON))
+                    {
+                        pipeline->tx_fifo_write(mic_frame, AUDIO_FRAME_SAMPLES);
                     }
                 }
             }
-            vTaskDelay(pdMS_TO_TICKS(20));
+            else
+            {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
         }
     }
 }
@@ -258,3 +398,29 @@ void audio_pipeline_clear()
     if (AudioPipeline::instance())
         AudioPipeline::instance()->clear();
 }
+
+void audio_pipeline_clear_tx()
+{
+    if (AudioPipeline::instance())
+        AudioPipeline::instance()->clear_tx();
+}
+
+void audio_pipeline_set_vox_preroll_delay(uint8_t delay_frames)
+{
+    if (AudioPipeline::instance())
+        AudioPipeline::instance()->set_vox_preroll_delay(delay_frames);
+}
+
+uint8_t audio_pipeline_get_vox_preroll_delay()
+{
+    if (AudioPipeline::instance())
+        return AudioPipeline::instance()->get_vox_preroll_delay();
+    return 3;
+}
+
+void audio_pipeline_request_vox_reset()
+{
+    if (AudioPipeline::instance())
+        AudioPipeline::instance()->request_vox_reset();
+}
+

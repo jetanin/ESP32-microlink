@@ -52,6 +52,11 @@ public:
      */
     virtual void get_metrics(uint16_t &raw_min, uint16_t &raw_max, uint16_t &raw_avg, uint16_t &peak_to_peak) = 0;
 
+    /**
+     * @brief Retrieve smoothed moving energy / RMS value over sliding window (for spike-free VOX)
+     */
+    virtual uint16_t get_moving_rms() const = 0;
+
     virtual bool is_running() const = 0;
 };
 
@@ -60,7 +65,7 @@ public:
  */
 class AdcAudioIn : public AudioIn {
 public:
-    AdcAudioIn(uint8_t gpio_pin);
+    AdcAudioIn(uint8_t gpio_pin, int8_t pot_pin = -1);
     ~AdcAudioIn() override;
 
     bool init() override;
@@ -69,19 +74,36 @@ public:
     size_t read_samples(int16_t *dest, size_t count, TickType_t timeout_ticks = portMAX_DELAY) override;
     uint16_t get_last_raw() const override { return m_last_raw; }
     void get_metrics(uint16_t &raw_min, uint16_t &raw_max, uint16_t &raw_avg, uint16_t &peak_to_peak) override;
+    uint16_t get_moving_rms() const override { return m_moving_rms; }
     bool is_running() const override { return m_running; }
+
+    uint16_t get_pot_raw() const { return m_pot_raw; }
+    uint8_t  get_pot_step() const;
 
 private:
     uint8_t m_gpio_pin;
+    int8_t  m_pot_pin;
     adc_continuous_handle_t m_adc_handle;
     bool m_initialized;
     bool m_running;
 
+    // Potentiometer reading (ADC1 Channel 3)
+    uint16_t m_pot_raw;
+
     // DC bias tracking and level metrics
+    bool     m_first_sample;
     int32_t  m_dc_bias;
     uint16_t m_last_raw;
     uint16_t m_metric_min;
     uint16_t m_metric_max;
     uint32_t m_metric_sum;
     uint32_t m_metric_count;
+
+    // Moving Energy / RMS window (sliding window across recent frames to eliminate spikes)
+    static constexpr size_t RMS_WINDOW_SIZE = 4;
+    uint16_t m_rms_window[RMS_WINDOW_SIZE];
+    size_t   m_rms_idx;
+    uint16_t m_moving_rms;
+    uint64_t m_acc_energy;
+    uint32_t m_acc_count;
 };

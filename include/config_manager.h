@@ -24,11 +24,14 @@ struct ConfigData
     char proxy_host[64];
     uint16_t proxy_port;
     char proxy_password[32];
+    uint8_t vox_pre; // VOX pre-roll delay in frames (0..6, default 3 = 60 ms)
 };
 
 void config_manager_init();
 ConfigData config_manager_get();
 bool config_manager_save(const ConfigData &new_cfg);
+bool config_manager_set_vox_preroll(uint8_t frames);
+uint8_t config_manager_get_vox_preroll();
 
 // Favorites list management (JSON array of nodes/conferences)
 String config_manager_get_favorites();

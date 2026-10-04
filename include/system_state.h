@@ -56,6 +56,10 @@ struct SystemState
     uint32_t jitter_underflows;
     uint32_t jitter_overflows;
     bool loopback_active;
+    uint8_t op_mode;         // 0 = PTT, 1 = VOX
+    uint8_t vox_sensitivity; // 1 - 20
+    bool tot_triggered;
+    bool reg_failed;         // EchoLink registration attempt failed
 };
 
 // State Manager API
@@ -78,6 +82,9 @@ void system_state_update_rx_level(uint16_t raw_level, int16_t level_pct);
 void system_state_update_jitter(uint32_t depth, uint32_t underflows, uint32_t overflows);
 void system_state_set_loopback(bool active);
 bool system_state_get_loopback();
+void system_state_set_mode(uint8_t op_mode, uint8_t vox_sensitivity);
+void system_state_set_tot(bool triggered);
+void system_state_set_reg_failed(bool failed);
 
 // Helper string convertors
 const char *wifi_state_str(WifiState state);

@@ -24,6 +24,9 @@ const char DTMFDetector::DTMF_MAP[4][4] = {
     { '*', '0', '#', 'D' }
 };
 
+static float s_hamming[160];
+static bool s_hamming_initialized = false;
+
 static DTMFDetector s_detector;
 
 DTMFDetector::DTMFDetector()
@@ -42,6 +45,14 @@ void DTMFDetector::init()
 {
     reset();
     m_enabled = true;
+    if (!s_hamming_initialized)
+    {
+        for (int i = 0; i < 160; ++i)
+        {
+            s_hamming[i] = 0.54f - 0.46f * cosf(2.0f * (float)M_PI * (float)i / 159.0f);
+        }
+        s_hamming_initialized = true;
+    }
 }
 
 void DTMFDetector::reset()
@@ -65,7 +76,7 @@ char DTMFDetector::process_frame_160(const int16_t *samples)
         if (a > peak) peak = a;
     }
 
-    if (peak < 1200) // ~3.5% of full scale
+    if (peak < 500) // ~1.5% of full scale (-36 dBFS) to reliably detect weak radio DTMF
     {
         m_pause_hits++;
         if (m_pause_hits >= 2)
@@ -77,11 +88,19 @@ char DTMFDetector::process_frame_160(const int16_t *samples)
         return '\0';
     }
 
+    if (!s_hamming_initialized)
+    {
+        init();
+    }
+
+    // Apply Hamming window to reduce spectral leakage across adjacent DTMF bins
     float x[160];
+    float total_energy = 0.0f;
     constexpr float INV_32768 = 1.0f / 32768.0f;
     for (int i = 0; i < 160; ++i)
     {
-        x[i] = (float)samples[i] * INV_32768;
+        x[i] = ((float)samples[i] * INV_32768) * s_hamming[i];
+        total_energy += x[i] * x[i];
     }
 
     float power[8];
@@ -146,23 +165,25 @@ char DTMFDetector::process_frame_160(const int16_t *samples)
 
     char detected = '\0';
 
-    // Standard DTMF Validation Tests:
-    // 1. Minimum energy threshold
-    // 2. Selectivity (peak tone >= 2.5x second highest in group)
-    // 3. Twist check (ratio between low and high tone power within [0.15 .. 6.0])
-    constexpr float MIN_ENERGY = 1.0f;
-    if (row_max > MIN_ENERGY && col_max > MIN_ENERGY)
+    // Standard DTMF Validation Tests adapted for amateur radio channels:
+    // 1. Minimum energy threshold (row tone and column tone present)
+    // 2. Selectivity (peak tone >= 1.8x second highest in group)
+    // 3. Twist check: Expanded to [0.08 .. 35.0] (+/- 15 dB) to support FM receiver de-emphasis.
+    //    Digits '2', '3', '6' have high twist (~15x to 20x) because of large frequency gap.
+    // 4. SNR / Concentrated tone energy test: Total DTMF energy vs total signal energy
+    bool energy_ok = (row_max > 0.05f) && (col_max > 0.005f);
+    bool row_selective = (row_second <= 0.0005f) || (row_max >= 1.8f * row_second);
+    bool col_selective = (col_second <= 0.0005f) || (col_max >= 1.8f * col_second);
+
+    float twist = row_max / (col_max + 1e-6f);
+    bool twist_ok = (twist >= 0.08f && twist <= 35.0f);
+
+    float tone_energy = (row_max + col_max) / 58.5f;
+    bool snr_ok = (tone_energy >= 0.35f * total_energy);
+
+    if (energy_ok && row_selective && col_selective && twist_ok && snr_ok)
     {
-        bool row_selective = (row_second <= 0.001f) || (row_max >= 2.5f * row_second);
-        bool col_selective = (col_second <= 0.001f) || (col_max >= 2.5f * col_second);
-
-        float twist = row_max / (col_max + 1e-6f);
-        bool twist_ok = (twist >= 0.15f && twist <= 6.0f);
-
-        if (row_selective && col_selective && twist_ok)
-        {
-            detected = DTMF_MAP[row_best][col_best - 4];
-        }
+        detected = DTMF_MAP[row_best][col_best - 4];
     }
 
     // Debouncing & Confirmation State Machine (Requires >= 40 ms tone + >= 40 ms pause)

@@ -35,6 +35,12 @@ async function updateStatus() {
             elStateEl.className = 'status-value badge ' + (data.echolink.state === 'LOGGED_IN' ? 'badge-success' : (data.echolink.state === 'CONNECTING_DIR' ? 'badge-warning' : 'badge-danger'));
         }
 
+        // Link LED
+        const ledEl = document.getElementById('st_link_led');
+        if (ledEl) {
+            ledEl.textContent = data.link_led || 'Idle';
+        }
+
         // Connected Station
         const stationEl = document.getElementById('st_station');
         if (stationEl) {

@@ -8,6 +8,7 @@
 #include "echolink_client.h"
 #include "dtmf_controller.h"
 #include "announcer.h"
+#include "link_led.h"
 
 static WebServer s_server(80);
 static bool s_fs_mounted = false;
@@ -78,9 +79,13 @@ input:focus{outline:none;border-color:#00bcd4;}
 <div class="grid">
 <div><div class="label">WiFi Network</div><div id="st_wifi" class="val">Connecting...</div></div>
 <div><div class="label">EchoLink Status</div><div id="st_echolink" class="val badge badge-warn">CHECKING</div></div>
+<div><div class="label">Link LED</div><div id="st_link_led" class="val badge badge-info">Idle</div></div>
 <div><div class="label">Connected Station</div><div id="st_station" class="val">IDLE</div></div>
 <div><div class="label">Transmitter (TX)</div><div id="st_tx" class="val badge badge-info">IDLE</div></div>
 <div><div class="label">Receiver (RX)</div><div id="st_rx" class="val badge badge-info">IDLE</div></div>
+<div><div class="label">Operating Mode</div><div id="st_mode" class="val badge badge-info">PTT</div></div>
+<div><div class="label">VOX Sensitivity</div><div id="st_vox_sens" class="val">10 / 20</div></div>
+<div><div class="label">TOT (60 s limit)</div><div id="st_tot" class="val badge badge-info">OK</div></div>
 <div><div class="label">Free Heap RAM</div><div id="st_heap" class="val">---</div></div>
 </div>
 <div style="margin-top:10px;">
@@ -274,19 +279,36 @@ if(el){
 el.textContent=d.echolink.state;
 el.className='val badge '+(d.echolink.state==='LOGGED_IN'?'badge-ok':(d.echolink.state==='CONNECTING_DIR'?'badge-warn':'badge-err'));
 }
+var led=document.getElementById('st_link_led');
+if(led)led.textContent=d.link_led||'Idle';
 var st=document.getElementById('st_station');
 if(st){
 st.textContent=(d.station.callsign&&d.station.callsign.length>0)?(d.station.callsign+(d.station.node>0?' #'+d.station.node:'')+' - '+d.station.state):d.station.state;
 }
 var tx=document.getElementById('st_tx');
 if(tx){
-tx.textContent=d.tx_active?'TX ON':'IDLE';
+var txSrc=['','PTT','VOX','ANN','WEB'];
+var txLabel=d.tx_active?(txSrc[d.tx_source]||'TX')+' ON':'IDLE';
+tx.textContent=txLabel;
 tx.className='val badge '+(d.tx_active?'badge-err':'badge-info');
 }
 var rx=document.getElementById('st_rx');
 if(rx){
 rx.textContent=d.rx_active?'AUDIO RX':'IDLE';
 rx.className='val badge '+(d.rx_active?'badge-ok':'badge-info');
+}
+var sm=document.getElementById('st_mode');
+if(sm){
+var modeLabel=d.op_mode===1?'VOX':'PTT';
+sm.textContent=modeLabel;
+sm.className='val badge '+(d.op_mode===1?'badge-warn':'badge-info');
+}
+var ss=document.getElementById('st_vox_sens');
+if(ss)ss.textContent=(d.op_mode===1)?('Level '+d.vox_sensitivity+' / 20'):'-';
+var tot=document.getElementById('st_tot');
+if(tot){
+tot.textContent=d.tot_triggered?'FIRED':'OK';
+tot.className='val badge '+(d.tot_triggered?'badge-err':'badge-info');
 }
 var hp=document.getElementById('st_heap');
 if(hp)hp.textContent=Math.round(d.free_heap/1024)+' KB';
@@ -542,6 +564,14 @@ static void handle_api_status()
 
     doc["echolink"]["state"] = echolink_state_str(st.echolink_state);
 
+    LinkInputs link_in;
+    link_in.apMode = (st.wifi_state == WifiState::AP_MODE);
+    link_in.wifiUp = (st.wifi_state == WifiState::CONNECTED);
+    link_in.regFailed = st.reg_failed;
+    link_in.registered = (st.echolink_state == EchoLinkState::LOGGED_IN);
+    link_in.linked = (st.station_state == StationState::CONNECTED);
+    doc["link_led"] = linkLedName(pickLinkLed(link_in));
+
     doc["station"]["state"] = station_state_str(st.station_state);
     doc["station"]["callsign"] = st.connected_callsign;
     doc["station"]["node"] = st.connected_node;
@@ -561,6 +591,10 @@ static void handle_api_status()
     doc["jitter"]["underflows"] = st.jitter_underflows;
     doc["jitter"]["overflows"]  = st.jitter_overflows;
     doc["loopback_active"]      = st.loopback_active;
+
+    doc["op_mode"]         = st.op_mode;          // 0=PTT, 1=VOX
+    doc["vox_sensitivity"] = st.vox_sensitivity;  // 1-9
+    doc["tot_triggered"]   = st.tot_triggered;    // true when 60 s TOT fired
 
     doc["free_heap"] = st.free_heap;
     doc["uptime"] = st.uptime_sec;

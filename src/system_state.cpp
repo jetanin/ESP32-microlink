@@ -17,7 +17,15 @@ static SystemState s_state = {
     .ptt_press_count = 0,
     .last_tx_duration_ms = 0,
     .free_heap = 0,
-    .uptime_sec = 0};
+    .uptime_sec = 0,
+    .jitter_depth = 0,
+    .jitter_underflows = 0,
+    .jitter_overflows = 0,
+    .loopback_active = false,
+    .op_mode = 0,
+    .vox_sensitivity = 10,
+    .tot_triggered = false,
+    .reg_failed = false};
 
 static uint32_t s_tx_start_time_ms = 0;
 
@@ -189,6 +197,34 @@ bool system_state_get_loopback()
         system_state_unlock();
     }
     return active;
+}
+
+void system_state_set_mode(uint8_t op_mode, uint8_t vox_sensitivity)
+{
+    if (system_state_lock(pdMS_TO_TICKS(10)))
+    {
+        s_state.op_mode = op_mode;
+        s_state.vox_sensitivity = vox_sensitivity;
+        system_state_unlock();
+    }
+}
+
+void system_state_set_tot(bool triggered)
+{
+    if (system_state_lock(pdMS_TO_TICKS(10)))
+    {
+        s_state.tot_triggered = triggered;
+        system_state_unlock();
+    }
+}
+
+void system_state_set_reg_failed(bool failed)
+{
+    if (system_state_lock(pdMS_TO_TICKS(10)))
+    {
+        s_state.reg_failed = failed;
+        system_state_unlock();
+    }
 }
 
 const char *wifi_state_str(WifiState state)

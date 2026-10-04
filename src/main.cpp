@@ -30,6 +30,7 @@
 #include "dtmf_controller.h"
 #include "dtmf_detector.h"
 #include "announcer.h"
+#include "link_led.h"
 
 // Task Priorities (Audio > Network/EchoLink > System/Status > Web UI)
 static constexpr UBaseType_t TASK_PRIO_SYSTEM = 2;
@@ -40,7 +41,7 @@ static constexpr uint32_t HEARTBEAT_INTERVAL_MS = 5000;
 
 // Audio Subsystems
 static AudioOut s_audio_out;
-static AdcAudioIn s_audio_in(PIN_MIC_AO);
+static AdcAudioIn s_audio_in(PIN_MIC_AO, PIN_POT_VOX_SENS); // GPIO1=Mic, GPIO3=VOX Pot
 static AudioPipeline s_pipeline(s_audio_in, s_audio_out);
 
 // Announcer local sink: writes directly to I2S DAC (bypasses jitter buffer).
@@ -73,21 +74,65 @@ static bool announcer_channel_busy()
 }
 
 // Operating Modes (PTT vs VOX)
-enum class OperatingMode : uint8_t {
+enum class OperatingMode : uint8_t
+{
     PTT = 0,
     VOX
 };
 
+// VOX Sensitivity mapping: step 1-20 -> Moving Energy / RMS threshold (12-bit AC scale)
+// Subdivided into 20 granular steps for precise threshold adjustment.
+// Ambient noise floor: ~10-20 RMS. Speaking voice: ~70-200 RMS. Shouting: ~300+ RMS.
+// Higher step = more sensitive (triggers on quieter signals)
+static constexpr uint16_t VOX_THRESHOLDS[21] = {
+    0,   // unused (index 0)
+    420, // step 1 - least sensitive (loud shout)
+    370, // step 2
+    325, // step 3
+    285, // step 4
+    250, // step 5
+    220, // step 6
+    195, // step 7
+    170, // step 8
+    150, // step 9
+    130, // step 10 - medium (default, normal speech)
+    112, // step 11
+    96,  // step 12
+    82,  // step 13
+    70,  // step 14
+    58,  // step 15
+    48,  // step 16
+    39,  // step 17
+    31,  // step 18
+    24,  // step 19
+    18,  // step 20 - most sensitive (quiet whisper)
+};
+
+static constexpr uint32_t TOT_MAX_MS = 60000;  // 60 s TX limit
+static constexpr uint32_t VOX_HANG_MS = 600;   // hold TX open after speech stops (600 ms hang time)
+static constexpr uint32_t VOX_OPEN_FRAMES = 2; // consecutive active frames to open VOX
+
 static OperatingMode s_op_mode = OperatingMode::PTT;
-static uint8_t s_current_sensitivity = 5;
+static uint8_t s_current_sensitivity = 10;
 static uint8_t s_last_announced_sensitivity = 0;
 static uint32_t s_pot_stable_start = 0;
 static uint32_t s_last_sensitivity_announce_time = 0;
-static uint8_t s_last_raw_pot_step = 5;
+static uint8_t s_last_raw_pot_step = 10;
+
+// VOX Voice-Activity Detector state
+static bool s_vox_tx_open = false;   // Is VOX currently holding TX?
+static uint32_t s_vox_hang_end = 0;  // Time when hang timer expires
+static uint8_t s_vox_open_count = 0; // Consecutive active frames counter
+
+// TOT state (shared between PTT and VOX modes)
+static bool s_tot_triggered = false; // TRUE when TOT has fired and TX was cut
+static uint32_t s_tx_started_at = 0; // Wall-clock ms when TX keyed up
+static bool s_tx_was_active = false; // Previous TX state (edge detection)
 
 static void switch_mode(OperatingMode new_mode)
 {
-    if (s_op_mode == new_mode) return;
+    if (s_op_mode == new_mode)
+        return;
 
     // Rule: Mode switch during an announcement: abort it and apply normal force TX off
     if (Announcer::instance().busy())
@@ -96,8 +141,18 @@ static void switch_mode(OperatingMode new_mode)
     }
     echolink_client_tx_force_off();
 
+    // Reset VOX state on mode change
+    s_vox_tx_open = false;
+    s_vox_hang_end = 0;
+    s_vox_open_count = 0;
+    s_tot_triggered = false;
+    s_tx_was_active = false;
+
     s_op_mode = new_mode;
+    audio_pipeline_request_vox_reset();
     Serial.printf("[MODE] Switched to %s mode\n", (s_op_mode == OperatingMode::PTT) ? "PTT" : "VOX");
+    system_state_set_mode((uint8_t)s_op_mode, s_current_sensitivity);
+    system_state_set_tot(false);
 
     if (s_op_mode == OperatingMode::PTT)
     {
@@ -113,10 +168,17 @@ static void switch_mode(OperatingMode new_mode)
 
 static void set_vox_sensitivity(uint8_t step)
 {
-    if (step < 1) step = 1;
-    if (step > 9) step = 9;
+    if (step < 1)
+        step = 1;
+    if (step > 20)
+        step = 20;
     s_current_sensitivity = step;
-    Serial.printf("[VOX] Sensitivity set to %u\n", step);
+    // Also update pot tracker so the pot read doesn't immediately override this serial command
+    // (the pot will only override again when it's physically moved to a different position)
+    s_last_raw_pot_step = step;
+    s_pot_stable_start = 0; // Reset stability so sensitivity won't re-announce old value
+    system_state_set_mode((uint8_t)s_op_mode, step);
+    Serial.printf("[VOX] Sensitivity set to %u / 20 (threshold RMS=%u)\n", step, VOX_THRESHOLDS[step]);
 }
 
 // 2-second single-shot loopback PCM buffer (for diagnostic hardware test)
@@ -144,14 +206,25 @@ void setup()
     pinMode(PIN_LED_RED, OUTPUT);
     pinMode(PIN_LED_RX, OUTPUT);
     pinMode(PIN_BUTTON_PTT, INPUT_PULLUP);
+    pinMode(PIN_SWITCH_VOX, INPUT_PULLUP); // LOW = VOX mode, HIGH = PTT mode
 
     digitalWrite(PIN_LED_GREEN, LOW);
     digitalWrite(PIN_LED_RED, LOW);
     digitalWrite(PIN_LED_RX, LOW);
 
+    // Read VOX switch on boot to set initial operating mode
+    s_op_mode = (digitalRead(PIN_SWITCH_VOX) == LOW) ? OperatingMode::VOX : OperatingMode::PTT;
+    s_current_sensitivity = 10;
+    s_last_raw_pot_step = 10;
+
     // 1. Initialize State Machine & NVS Config
     system_state_init();
     config_manager_init();
+    ConfigData cfg = config_manager_get();
+    s_pipeline.set_vox_preroll_delay(cfg.vox_pre);
+    Serial.printf("VOX pre-roll: %u frames (%u ms)\n", cfg.vox_pre, (unsigned int)(cfg.vox_pre * 20));
+    // Sync initial mode to system state (must be after system_state_init)
+    system_state_set_mode((uint8_t)s_op_mode, s_current_sensitivity);
 
     print_banner();
 
@@ -258,38 +331,226 @@ void loop()
 {
     static uint32_t last_heartbeat = 0;
     static uint32_t last_stats_sync = 0;
+    static bool last_vox_switch = true; // Previous state of GPIO23 (HIGH = PTT)
     uint32_t now = millis();
 
-    // Process WiFi DNS (Captive Portal) and HTTP Web Server
+    // =========================================================================
+    // 1. Process WiFi, Web Server and Announcer
+    // =========================================================================
     wifi_manager_process();
     web_ui_process();
-
-    // Service Voice & Beep Announcer Engine
     announcer_update();
 
-    // In VOX mode, monitor pot stability and sensitivity changes
-    if (s_op_mode == OperatingMode::VOX)
+    // Reset VOX pre-roll buffer at the end of ROUTE_TX announcement + VOX inhibit window
+    static bool s_was_vox_inhibited = false;
+    bool is_vox_inhibited = Announcer::instance().is_vox_inhibited();
+    if (s_was_vox_inhibited && !is_vox_inhibited)
     {
-        if (s_current_sensitivity != s_last_raw_pot_step)
+        audio_pipeline_request_vox_reset();
+    }
+    s_was_vox_inhibited = is_vox_inhibited;
+
+    // Reset VOX pre-roll on WiFi disconnect
+    static bool s_was_wifi_connected = false;
+    bool is_wifi_connected = wifi_manager_is_connected();
+    if (s_was_wifi_connected && !is_wifi_connected)
+    {
+        audio_pipeline_request_vox_reset();
+    }
+    s_was_wifi_connected = is_wifi_connected;
+
+    // =========================================================================
+    // 2. VOX Mode Switch Polling (GPIO 23, debounced)
+    // =========================================================================
+    {
+        static uint32_t switch_debounce_ts = 0;
+        static bool switch_raw_last = true;
+        bool switch_raw = (digitalRead(PIN_SWITCH_VOX) == LOW); // LOW = VOX mode
+        if (switch_raw != switch_raw_last)
         {
-            s_last_raw_pot_step = s_current_sensitivity;
-            s_pot_stable_start = now; // Pot moved, reset stability timer
+            switch_raw_last = switch_raw;
+            switch_debounce_ts = now;
         }
-        else if (s_pot_stable_start > 0 && (now - s_pot_stable_start >= 1500))
+        if (now - switch_debounce_ts >= 50)
         {
-            if (s_current_sensitivity != s_last_announced_sensitivity)
+            OperatingMode wanted = switch_raw ? OperatingMode::VOX : OperatingMode::PTT;
+            if (wanted != s_op_mode)
             {
-                if (now - s_last_sensitivity_announce_time >= 3000)
-                {
-                    s_last_announced_sensitivity = s_current_sensitivity;
-                    s_last_sensitivity_announce_time = now;
-                    Announcer::instance().announceSensitivity(s_current_sensitivity);
-                }
+                switch_mode(wanted);
+                last_vox_switch = switch_raw;
             }
         }
     }
 
-    // Sync Web UI loopback toggle with AudioPipeline
+    // =========================================================================
+    // 3. Sensitivity Stability Announce (pot moved logic in section 5's stats sync)
+    // =========================================================================
+    if (s_op_mode == OperatingMode::VOX &&
+        s_last_raw_pot_step == s_current_sensitivity &&
+        s_pot_stable_start > 0 &&
+        (now - s_pot_stable_start >= 1500) &&
+        (s_current_sensitivity != s_last_announced_sensitivity) &&
+        (now - s_last_sensitivity_announce_time >= 3000))
+    {
+        s_last_announced_sensitivity = s_current_sensitivity;
+        s_last_sensitivity_announce_time = now;
+        Announcer::instance().announceSensitivity(s_current_sensitivity);
+    }
+
+    // =========================================================================
+    // 4. TOT (Time-Out Timer) — monitors any TX source, 60 s hard limit
+    // =========================================================================
+    {
+        bool tx_now = echolink_client_is_tx_active();
+
+        // Rising edge: TX just opened
+        if (tx_now && !s_tx_was_active)
+        {
+            s_tx_started_at = now;
+            s_tot_triggered = false;
+            system_state_set_tot(false);
+        }
+
+        // TX is active: check elapsed time
+        if (tx_now && !s_tot_triggered)
+        {
+            uint32_t elapsed = now - s_tx_started_at;
+            if (elapsed >= TOT_MAX_MS)
+            {
+                // Time-Out: force release all TX
+                Serial.println(F("[TOT] *** 60-second Time-Out Timer fired! TX released. ***"));
+                if (Announcer::instance().busy())
+                    Announcer::instance().abort();
+                echolink_client_tx_force_off();
+                if (s_vox_tx_open)
+                {
+                    s_vox_tx_open = false;
+                    s_vox_hang_end = 0;
+                    s_vox_open_count = 0;
+                }
+                digitalWrite(PIN_LED_RED, LOW);
+                s_tot_triggered = true;
+                system_state_set_tot(true);
+            }
+        }
+
+        // Falling edge: TX released
+        if (!tx_now && s_tx_was_active)
+        {
+            s_tot_triggered = false; // Ready for next TX
+            system_state_set_tot(false);
+        }
+
+        s_tx_was_active = tx_now;
+    }
+
+    // =========================================================================
+    // 5. Mic metrics sync (every 100 ms) — must run BEFORE VOX VAD
+    // =========================================================================
+    if (now - last_stats_sync >= 100)
+    {
+        last_stats_sync = now;
+
+        JitterBufferStats jstats = s_pipeline.get_stats();
+        system_state_update_jitter(jstats.current_depth_frames, jstats.underflow_count, jstats.overflow_count);
+
+        uint16_t r_min, r_max, r_avg, vpp;
+        s_audio_in.get_metrics(r_min, r_max, r_avg, vpp);
+
+        // Map vpp to 0-100 percentage for Web UI
+        int16_t pct = (vpp * 100) / 1200;
+        if (pct > 100)
+            pct = 100;
+        system_state_update_mic(r_avg, pct);
+
+        // Also read pot sensitivity every 100 ms
+        uint8_t pot_step = s_audio_in.get_pot_step();
+        if (pot_step != s_last_raw_pot_step)
+        {
+            Serial.printf("[POT] VOX Sensitivity changed: step %u -> %u (raw=%u)\n",
+                          s_last_raw_pot_step, pot_step, s_audio_in.get_pot_raw());
+            s_last_raw_pot_step = pot_step;
+            s_current_sensitivity = pot_step;
+            s_pot_stable_start = now;
+        }
+        // Keep system state in sync with current mode/sensitivity (Web UI reads this)
+        system_state_set_mode((uint8_t)s_op_mode, s_current_sensitivity);
+    }
+
+    // =========================================================================
+    // 6. VOX Voice Activity Detector (only when in VOX mode, not TOT-locked)
+    // =========================================================================
+    if (s_op_mode == OperatingMode::VOX && !s_tot_triggered && !Announcer::instance().is_vox_inhibited())
+    {
+        // Read smoothed moving energy / RMS (calculated over a 4-frame / 80 ms sliding window in AdcAudioIn)
+        uint16_t moving_rms = s_audio_in.get_moving_rms();
+        uint16_t threshold = VOX_THRESHOLDS[s_current_sensitivity];
+        bool voice_active = (moving_rms >= threshold);
+
+        // Attack time tracker: signal must be sustained for >= 40 ms (filters out brief click spikes)
+        static uint32_t s_speech_start_time = 0;
+
+        // Periodic VOX debug print (every 2 s) — shows live mic RMS, threshold and pot reading
+        static uint32_t vox_debug_ts = 0;
+        if (now - vox_debug_ts >= 2000)
+        {
+            vox_debug_ts = now;
+            Serial.printf("[VOX] RMS=%u | Threshold=%u (sens=%u/20) | TX=%s | Pot raw=%u step=%u\n",
+                          moving_rms, threshold, s_current_sensitivity,
+                          s_vox_tx_open ? "OPEN" : "idle",
+                          s_audio_in.get_pot_raw(), s_audio_in.get_pot_step());
+        }
+
+        if (voice_active)
+        {
+            if (s_speech_start_time == 0)
+            {
+                s_speech_start_time = now;
+            }
+
+            // Attack time verification: signal must stay above threshold for >= 40 ms (2 frames)
+            // This prevents short clicks/pops/spikes from keying the transmitter
+            if (!s_vox_tx_open && (now - s_speech_start_time >= 40))
+            {
+                s_vox_tx_open = true;
+                if (echolink_client_tx_request(TxSource::VOX))
+                {
+                    system_state_set_ptt(true);
+                    Serial.printf("[VOX] >>> TX OPENED (Moving RMS=%u >= Threshold=%u, sens=%u/20)\n",
+                                  moving_rms, threshold, s_current_sensitivity);
+                }
+            }
+            // Refresh hang timer while speech continues
+            s_vox_hang_end = now + VOX_HANG_MS;
+        }
+        else
+        {
+            // Reset speech start time if signal drops below threshold
+            s_speech_start_time = 0;
+        }
+
+        // Close VOX after hang time expires
+        if (s_vox_tx_open && now >= s_vox_hang_end)
+        {
+            s_vox_tx_open = false;
+            s_speech_start_time = 0;
+            echolink_client_tx_release(TxSource::VOX);
+            system_state_set_ptt(false);
+            Serial.println(F("[VOX] TX closed (hang timer expired)"));
+        }
+    }
+    else if (s_op_mode != OperatingMode::VOX && s_vox_tx_open)
+    {
+        // Mode changed while VOX was open — close cleanly
+        s_vox_tx_open = false;
+        s_vox_open_count = 0;
+        echolink_client_tx_release(TxSource::VOX);
+        system_state_set_ptt(false);
+    }
+
+    // =========================================================================
+    // 7. Sync Web UI loopback toggle with AudioPipeline
+    // =========================================================================
     bool web_loopback_req = system_state_get_loopback();
     if (web_loopback_req != s_pipeline.is_loopback_active())
     {
@@ -305,23 +566,9 @@ void loop()
         }
     }
 
-    // Update Jitter Buffer stats and mic level into global state (every 100 ms)
-    if (now - last_stats_sync >= 100)
-    {
-        last_stats_sync = now;
-
-        JitterBufferStats jstats = s_pipeline.get_stats();
-        system_state_update_jitter(jstats.current_depth_frames, jstats.underflow_count, jstats.overflow_count);
-
-        uint16_t r_min, r_max, r_avg, vpp;
-        s_audio_in.get_metrics(r_min, r_max, r_avg, vpp);
-        int16_t pct = (vpp * 100) / 1200;
-        if (pct > 100)
-            pct = 100;
-        system_state_update_mic(r_avg, pct);
-    }
-
-    // Periodic Heartbeat Log
+    // =========================================================================
+    // 8. Periodic Heartbeat Log
+    // =========================================================================
     if (!s_is_recording && !s_is_playing && (now - last_heartbeat >= HEARTBEAT_INTERVAL_MS))
     {
         last_heartbeat = now;
@@ -331,7 +578,7 @@ void loop()
         SystemState st = system_state_get();
         JitterBufferStats js = s_pipeline.get_stats();
 
-        Serial.printf("[HEARTBEAT] Up: %02lu:%02lu:%02lu | Heap: %u B | WiFi: %s | EL: %s | Station: %s (%s) | JB: %u/32 | Under/Drop: %u/%u\n",
+        Serial.printf("[HEARTBEAT] Up: %02lu:%02lu:%02lu | Heap: %u B | WiFi: %s | EL: %s | Station: %s (%s) | JB: %u/32 | Under/Drop: %u/%u | Mode: %s | VOX-Sen: %u (pot: raw=%u step=%u)\n",
                       (unsigned long)(uptime_s / 3600),
                       (unsigned long)((uptime_s % 3600) / 60),
                       (unsigned long)(uptime_s % 60),
@@ -342,10 +589,16 @@ void loop()
                       strlen(st.connected_callsign) > 0 ? st.connected_callsign : "NONE",
                       (unsigned int)js.current_depth_frames,
                       (unsigned int)js.underflow_count,
-                      (unsigned int)js.overflow_count);
+                      (unsigned int)js.overflow_count,
+                      (s_op_mode == OperatingMode::VOX) ? "VOX" : "PTT",
+                      (unsigned int)s_current_sensitivity,
+                      (unsigned int)s_audio_in.get_pot_raw(),
+                      (unsigned int)s_audio_in.get_pot_step());
     }
 
-    // Serial Command Interpreter
+    // =========================================================================
+    // 9. Serial Command Interpreter
+    // =========================================================================
     if (Serial.available())
     {
         String line = Serial.readStringUntil('\n');
@@ -430,6 +683,40 @@ void loop()
         {
             int step = line.substring(line.indexOf(' ') + 1).toInt();
             set_vox_sensitivity((uint8_t)step);
+        }
+        else if (line.startsWith("vox preroll") || line.startsWith("vox pre"))
+        {
+            int sp = line.indexOf(' ', 4);
+            if (sp > 0)
+            {
+                String arg = line.substring(sp + 1);
+                arg.trim();
+                if (arg.length() > 0 && isDigit(arg.charAt(0)))
+                {
+                    int val = arg.toInt();
+                    if (val >= 0 && val <= 6)
+                    {
+                        uint8_t frames = (uint8_t)val;
+                        config_manager_set_vox_preroll(frames);
+                        s_pipeline.set_vox_preroll_delay(frames);
+                        Serial.printf("VOX pre-roll: %u frames (%u ms)\n", frames, (unsigned int)(frames * 20));
+                    }
+                    else
+                    {
+                        Serial.println(F("[VOX] Invalid pre-roll frames: must be 0..6 (0..120 ms latency)"));
+                    }
+                }
+                else
+                {
+                    uint8_t cur = s_pipeline.get_vox_preroll_delay();
+                    Serial.printf("VOX pre-roll: %u frames (%u ms)\n", cur, (unsigned int)(cur * 20));
+                }
+            }
+            else
+            {
+                uint8_t cur = s_pipeline.get_vox_preroll_delay();
+                Serial.printf("VOX pre-roll: %u frames (%u ms)\n", cur, (unsigned int)(cur * 20));
+            }
         }
         else if (line.startsWith("say "))
         {
@@ -522,11 +809,25 @@ void loop()
             Serial.printf("Station Name  : %s\n", cfg.station_name);
             Serial.printf("Location/QTH  : %s\n", cfg.location);
             Serial.printf("Web Admin User: %s\n", cfg.web_user);
+            Serial.printf("VOX Pre-roll  : %u frames (%u ms)\n", cfg.vox_pre, (unsigned int)(cfg.vox_pre * 20));
             Serial.println(F("------------------------------------\n"));
         }
         else if (line.equalsIgnoreCase("s") || line.equalsIgnoreCase("status"))
         {
             print_status_summary();
+        }
+        else if (line.equalsIgnoreCase("led"))
+        {
+            SystemState st = system_state_get();
+            LinkInputs in;
+            in.apMode = (st.wifi_state == WifiState::AP_MODE);
+            in.wifiUp = (st.wifi_state == WifiState::CONNECTED);
+            in.regFailed = st.reg_failed;
+            in.registered = (st.echolink_state == EchoLinkState::LOGGED_IN);
+            in.linked = (st.station_state == StationState::CONNECTED);
+            LinkLed l = pickLinkLed(in);
+            Serial.printf("LED state: %s (apMode=%d, wifiUp=%d, regFailed=%d, registered=%d, linked=%d)\n",
+                          linkLedName(l), (int)in.apMode, (int)in.wifiUp, (int)in.regFailed, (int)in.registered, (int)in.linked);
         }
         else if (line.equalsIgnoreCase("h") || line.equalsIgnoreCase("?") || line.equalsIgnoreCase("help"))
         {
@@ -536,7 +837,8 @@ void loop()
             Serial.println(F(" 'd'                      - Disconnect from current station"));
             Serial.println(F(" 'mode ptt'               - Switch to PTT mode"));
             Serial.println(F(" 'mode vox'               - Switch to VOX mode"));
-            Serial.println(F(" 'sensitivity <1-9>'      - Set VOX sensitivity level"));
+            Serial.println(F(" 'sensitivity <1-20>'     - Set VOX sensitivity level"));
+            Serial.println(F(" 'vox preroll <0-6>'      - Set VOX pre-roll frames (0..120 ms latency)"));
             Serial.println(F(" 'say <words>'            - Test announcer (local + TX)"));
             Serial.println(F(" 'abort'                  - Abort current announcement"));
             Serial.println(F(" 'set callsign <CALL>'    - Set EchoLink callsign (e.g. HS1ABC-L)"));
@@ -546,6 +848,7 @@ void loop()
             Serial.println(F(" 'set location <QTH>'     - Set Location / Frequency"));
             Serial.println(F(" 'register'               - Force immediate EchoLink registration"));
             Serial.println(F(" 'config'                 - Print current stored configuration"));
+            Serial.println(F(" 'led'                    - Print link status LED state and inputs"));
             Serial.println(F(" '1'                      - Play 1 kHz tone on PCM5102A DAC"));
             Serial.println(F(" '2'                      - Measure KY-038 mic level"));
             Serial.println(F(" '3'                      - 2-second record and playback"));
@@ -593,7 +896,7 @@ static void status_button_task(void *pvParameters)
                     // PTT Pressed -> Transmit active
                     ptt_down_time = now;
                     system_state_set_ptt(true);
-                    digitalWrite(PIN_LED_RED, HIGH);
+                    // Note: PIN_LED_RED now centrally driven by st.tx_active in the LED section below
                     Serial.println(F("\n[PTT BUTTON] >>> PRESSED (TX ACTIVE)"));
 
                     // Notify EchoLink client
@@ -610,7 +913,7 @@ static void status_button_task(void *pvParameters)
                 {
                     // PTT Released -> Transmit inactive
                     system_state_set_ptt(false);
-                    digitalWrite(PIN_LED_RED, LOW);
+                    // Note: PIN_LED_RED now centrally driven by st.tx_active in the LED section below
                     s_is_recording = false;
 
                     // Notify EchoLink client
@@ -661,30 +964,41 @@ static void status_button_task(void *pvParameters)
 
         SystemState st = system_state_get();
 
+        // RED LED: TX indicator — follows tx_active from ANY source (PTT, VOX, Announcement, Web UI)
+        // This ensures VOX TX also lights up the Red LED, not just the hardware PTT button
+        digitalWrite(PIN_LED_RED, st.tx_active ? HIGH : LOW);
+
         // RX active LED indicator (GPIO 22): ON when receiving audio, in loopback, or playing tones/recordings
         bool rx_led_active = st.rx_active || s_pipeline.is_loopback_active() || s_is_playing;
         digitalWrite(PIN_LED_RX, rx_led_active ? HIGH : LOW);
 
-        // Green LED status indicator (when not transmitting or playing diagnostic audio)
-        if (!s_is_playing && !s_is_recording && !s_pipeline.is_loopback_active())
+        // Link Status Green LED (PIN_LED_GREEN)
+        static LedPattern s_link_pattern;
+        static LinkLed s_last_link_led = LinkLed::Idle;
+        static bool s_link_led_inited = false;
+        static int s_last_pin_level = -1;
+
+        LinkInputs link_in;
+        link_in.apMode = (st.wifi_state == WifiState::AP_MODE);
+        link_in.wifiUp = (st.wifi_state == WifiState::CONNECTED);
+        link_in.regFailed = st.reg_failed;
+        link_in.registered = (st.echolink_state == EchoLinkState::LOGGED_IN);
+        link_in.linked = (st.station_state == StationState::CONNECTED);
+
+        LinkLed cur_led = pickLinkLed(link_in);
+        if (!s_link_led_inited || cur_led != s_last_link_led)
         {
-            if (st.wifi_state == WifiState::CONNECTED && st.echolink_state == EchoLinkState::LOGGED_IN)
-            {
-                // Solid green when WiFi + EchoLink registered
-                digitalWrite(PIN_LED_GREEN, HIGH);
-            }
-            else if (st.wifi_state == WifiState::AP_MODE)
-            {
-                // Fast blink in SoftAP mode (100 ms on / 100 ms off)
-                uint32_t cycle = now % 200;
-                digitalWrite(PIN_LED_GREEN, (cycle < 100) ? HIGH : LOW);
-            }
-            else
-            {
-                // Slow pulse when waiting for WiFi (50 ms on / 950 ms off)
-                uint32_t cycle = now % 1000;
-                digitalWrite(PIN_LED_GREEN, (cycle < 50) ? HIGH : LOW);
-            }
+            Serial.printf("LED state: %s\n", linkLedName(cur_led));
+            s_last_link_led = cur_led;
+            s_link_led_inited = true;
+        }
+
+        bool pin_on = s_link_pattern.update(cur_led, now);
+        int pin_level = pin_on ? HIGH : LOW;
+        if (pin_level != s_last_pin_level)
+        {
+            digitalWrite(PIN_LED_GREEN, pin_level);
+            s_last_pin_level = pin_level;
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));

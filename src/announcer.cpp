@@ -98,7 +98,14 @@ void Announcer::say(const char *text, uint8_t route)
 
 void Announcer::abort()
 {
-    m_abort_requested = true;
+    if (!m_active && m_queue_count == 0)
+    {
+        // Already idle — clear flag silently, don't log noise
+        m_abort_requested = false;
+        return;
+    }
+
+    m_abort_requested = false; // Clear flag first so update() doesn't re-trigger
     m_queue_head = 0;
     m_queue_tail = 0;
     m_queue_count = 0;
@@ -114,7 +121,7 @@ void Announcer::abort()
 
     m_active = false;
     m_inhibit_until_ms = millis() + 300;
-    Serial.println(F("[ANNOUNCER] Aborted immediately, queue cleared, TX released"));
+    Serial.println(F("[ANNOUNCER] Aborted, queue cleared, TX released"));
 }
 
 void Announcer::announceConnected(uint32_t node)
@@ -348,10 +355,11 @@ void Announcer::processNextItem()
 
 void Announcer::update()
 {
-    // Check if abort was requested
+    // Check if abort was requested externally (set by abort() or by the update loop itself)
+    // abort() already clears the flag and resets state — this guard handles any residual set
     if (m_abort_requested)
     {
-        abort();
+        m_abort_requested = false; // Clear and skip this cycle
         return;
     }
 

@@ -12,12 +12,13 @@
 
 - 🔗 **Full EchoLink VoIP** — RTP/RTCP audio streaming with GSM 06.10 Full-Rate codec
 - 🌐 **EchoLink Proxy support** — connects through public proxy servers (no open UDP ports required)
-- 🎙️ **PTT and VOX modes** — push-button PTT or voice-activated transmit, selected with a hardware switch (GPIO 23); VOX sensitivity is set with a potentiometer (GPIO 3)
+- 🎙️ **PTT and VOX modes** — push-button PTT or voice-activated transmit, selected with a hardware switch (GPIO 23); VOX sensitivity (20 levels) is set with a potentiometer (GPIO 3)
+- ⏳ **VOX Pre-Roll Buffer** — static audio delay line (0..6 frames / 0..120 ms) that prevents initial syllable cutoff during VOX attack time
 - 📡 **DTMF control** — connect/disconnect stations by sending tones from a radio
 - 📢 **Spoken announcements** — beep-tone chimes for connect/disconnect/mode events (routed to both local speaker and EchoLink TX)
 - 🌍 **Web UI** — responsive mobile-friendly interface for status monitoring, connect/disconnect, settings and favorites management
 - 🔊 **Audio pipeline** — jitter buffer, underflow protection, real-time loopback diagnostics
-- 💡 **LED indicators** — WiFi/EchoLink status (green), TX active (red), RX audio (GPIO 22)
+- 💡 **LED indicators** — Link status patterns on Green LED (GPIO 10), TX active on Red LED (GPIO 11), RX audio on GPIO 22
 - 📶 **Captive portal** — SoftAP with DNS for first-time WiFi setup
 
 ---
@@ -44,7 +45,7 @@
 | **1**  | Mic ADC     | KY-038 Analog Output → ADC1_CH1     |
 | **2**  | PTT Button  | INPUT_PULLUP, active LOW            |
 | **3**  | VOX Pot     | Wiper → ADC1_CH3 (VOX sensitivity)  |
-| **10** | LED Green   | WiFi + EchoLink registered          |
+| **10** | LED Green   | Link status pattern (Setup / WiFi / Reg / Linked / Idle) |
 | **11** | LED Red     | TX active                           |
 | **22** | LED RX      | Receiving audio from remote station |
 | **23** | Mode Switch | INPUT_PULLUP: LOW = VOX, HIGH = PTT |
@@ -56,6 +57,23 @@
 > **Mode switch (GPIO 23):** SPDT switch, common → GPIO 23, one side → GND, the other side left unconnected (internal pull-up is used). Switch to GND = **VOX**, open (HIGH) = **PTT**. This way a broken wire or failed switch falls back to PTT, so the node never keys up from noise by accident.
 
 > **Pins to avoid on ESP32-C6:** GPIO 4, 5, 8, 9, 15 (strapping), GPIO 12/13 (USB), GPIO 16/17 (UART0), GPIO 24–30 (internal flash). GPIO 0 and 21 are kept free for a second pot (squelch/COS) and an optional I2S microphone (INMP441 SD).
+
+### Link Status LED Patterns (Green — GPIO 10)
+
+The green LED provides visual diagnostic feedback on connectivity and registration state. Patterns are evaluated top-to-bottom:
+
+| Priority | State | Pattern (ON / OFF ms) | Visual Appearance | Meaning |
+| :---: | :--- | :--- | :--- | :--- |
+| **1** | `SetupAp` | 80, 120, 80, 720 | Double flash | Waiting for WiFi setup (captive portal active) |
+| **2** | `WifiConnecting` | 100, 100 | Fast blink | Trying to join WiFi network |
+| **3** | `RegFailed` | 120, 180, 120, 180, 120, 1200 | Triple flash | Registration failed (latches until registration succeeds) |
+| **4** | `Registering` | 500, 500 | Slow blink | Waiting for EchoLink directory server login |
+| **5** | `Linked` | Steady ON | Solid ON | Connected to remote EchoLink station |
+| **6** | `Idle` | 80, 1920 | Heartbeat flash | Ready / registered, no station linked (never fully dark) |
+
+- **Pattern Restart:** On every state change, the pattern restarts immediately with the LED ON and the first step timer reset.
+- **Latch Behavior:** `RegFailed` remains active across background retries until registration succeeds.
+- **Alive Indication:** `Idle` uses a periodic 80 ms heartbeat so a dark LED never causes ambiguity between "idle" and "crashed/powered off".
 
 ---
 
@@ -69,20 +87,29 @@
                     │  GSM 06.10 codec     │
                     └──────────┬───────────┘
                RX              │         TX
-    ┌──────────▼──────────┐    │    ┌────▼────────────┐
-    │   JitterBuffer      │    │    │ service_tx_audio│
-    │ (640 ms, 32 frames) │    │    │ ADC DMA capture │
-    └──────────┬──────────┘    │    └────▲────────────┘
-               │               │         │
-    ┌──────────▼──────────┐    │    ┌────┴──────┐
-    │  audio_playout_task │    │    │  KY-038   │
-    │  (prio 5, I2S DMA)  │    │    │  Mic ADC  │
-    └──────────┬──────────┘    │    └───────────┘
-               │               │
-    ┌──────────▼──────────┐    │    ┌────────────┐
-    │   PCM5102A DAC      │    └────│  Announcer │  beep chimes
-    │   I2S output        │         │  (LOCAL+TX)│
-    └─────────────────────┘         └────────────┘
+    ┌──────────▼──────────┐    │    ┌────▼─────────────────┐
+    │   JitterBuffer      │    │    │   service_tx_audio   │ (prio 3)
+    │ (640 ms, 32 frames) │    │    └────▲─────────────────┘
+    └──────────┬──────────┘    │         │ read_samples
+               │               │    ┌────┴─────────────────┐
+    ┌──────────▼──────────┐    │    │     TX PCM FIFO      │ (1280 samples)
+    │  audio_playout_task │    │    └────▲─────────────────┘
+    │  (prio 5, I2S DMA)  │    │         │
+    └──────────┬──────────┘    │    ┌────┴─────────────────┐
+               │               │    │  audio_capture_task  │ (prio 4, 50 Hz)
+    ┌──────────▼──────────┐    │    │  ADC DMA capture     │
+    │   PCM5102A DAC      │    │    │  VoxPreRoll (0-6 fr) │
+    │   I2S output        │    │    └────▲─────────────────┘
+    └─────────────────────┘    │         │
+                               │    ┌────┴──────┐
+                               │    │  KY-038   │
+                               │    │  Mic ADC  │
+                               │    └───────────┘
+                               │
+                               │    ┌────────────┐
+                               └────│  Announcer │  beep chimes
+                                    │  (LOCAL+TX)│
+                                    └────────────┘
 ```
 
 **Task priorities (high → low):**  
@@ -92,14 +119,15 @@
 
 ## Audio Specification
 
-| Parameter     | Value                                          |
-| ------------- | ---------------------------------------------- |
-| Sample rate   | 8,000 Hz                                       |
-| Codec         | GSM 06.10 Full-Rate                            |
-| Frame size    | 160 samples / 20 ms                            |
-| RTP packet    | 4 frames / 80 ms (640 samples)                 |
-| Jitter buffer | 32 frames (640 ms capacity), 4-frame watermark |
-| I2S output    | 32-bit stereo (PCM5102A PLL-mode compatible)   |
+| Parameter       | Value                                                         |
+| --------------- | ------------------------------------------------------------- |
+| Sample rate     | 8,000 Hz                                                      |
+| Codec           | GSM 06.10 Full-Rate                                           |
+| Frame size      | 160 samples / 20 ms                                           |
+| RTP packet      | 4 frames / 80 ms (640 samples)                                |
+| Jitter buffer   | 32 frames (640 ms capacity), 4-frame watermark                |
+| VOX Pre-roll    | Static ring buffer (up to 8 frames), default 3 frames (60 ms) |
+| I2S output      | 32-bit stereo (PCM5102A PLL-mode compatible)                  |
 
 ---
 
@@ -125,13 +153,25 @@ The transmit mode is selected with the mode switch on GPIO 23:
 | To GND (LOW)    | **VOX** | Microphone level above the sensitivity threshold |
 | Open (HIGH)     | **PTT** | PTT button (GPIO 2) held down                    |
 
-- **PTT mode:** only the PTT button keys the transmitter. The microphone level and the potentiometer are ignored.
-- **VOX mode:** the PTT button is ignored. The threshold comes from the potentiometer on GPIO 3: turning it clockwise makes VOX **more sensitive** (lower threshold). VOX uses an attack time, hysteresis and a hang time so that clicks do not key the transmitter and speech is not chopped between words. The timing constants are defined at the top of the VOX source file.
-- **Switching modes** releases TX immediately and resets the VOX state, so nothing is left keyed after the switch is moved.
-- **Announcements** never key VOX: the VOX input is inhibited while an announcement plays and for a short time afterwards.
-- The mode and sensitivity can also be set from the serial console (`mode ptt`, `mode vox`, `sensitivity <1-9>`). The node announces mode changes, and in VOX mode announces the sensitivity step after the potentiometer has stopped moving.
+- **PTT mode:** Only the PTT button keys the transmitter. The microphone level and the potentiometer are ignored. Audio bypasses the pre-roll buffer completely with **0 ms added latency**.
+- **VOX mode:** The PTT button is ignored. Voice detection uses a **4-frame (80 ms) moving RMS energy window** to reject short acoustic clicks, pops, and spikes.
+  - **Sensitivity adjustment:** Managed via the potentiometer on GPIO 3 across **20 discrete logarithmic sensitivity steps** (`VOX_THRESHOLDS[1..20]`). Turning clockwise makes VOX more sensitive.
+  - **Attack & Hang timers:** Requires **40 ms attack confirmation** (signal sustained above threshold) to open TX, and maintains a **400 ms hang timer** to bridge pauses between words without chopping.
+- **VOX Pre-Roll Buffer (Audio Delay Line):**
+  - **The Problem:** Because VOX requires ~40 ms of speech to confirm voice activity and open TX, the first syllable of speech (e.g. saying *"one two three"*) would otherwise be cut off (*"...wo three"*).
+  - **The Solution:** A fixed static ring buffer (`VoxPreRoll`, 8-frame capacity) delays the transmitted audio by `N` frames (default 3 frames = 60 ms) while VOX detection decisions are evaluated on the live incoming frames. When VOX opens, the delayed stream begins from audio recorded *before* the trigger decision, preserving the speech onset completely.
+  - **PTT Bypass:** In PTT mode, audio bypasses the pre-roll delay line completely for zero latency.
+  - **Dynamic Configuration:** Configurable from **0 to 6 frames** (`0..120 ms` added TX latency in VOX mode) via serial command `vox preroll <0-6>` and persisted in NVS key `vox_pre`.
+  - **Automatic Resets:** The pre-roll buffer is automatically flushed and reset on:
+    1. Mode switches (PTT $\leftrightarrow$ VOX in either direction).
+    2. Completion of a `ROUTE_TX` announcement plus its 300 ms post-announcement VOX inhibit period (ensures no speaker bleed is transmitted).
+    3. WiFi or EchoLink session disconnects.
+    4. Any runtime delay setting change.
+- **Switching modes** releases TX immediately and resets the VOX state.
+- **Announcements** inhibit VOX while playing and for 300 ms afterwards.
+- The mode and sensitivity can also be set from the serial console (`mode ptt`, `mode vox`, `sensitivity <1-20>`, `vox preroll <0-6>`).
 
-**Tuning tip:** the KY-038 has no preamp and is noisy. Use serial command `2` to read the mic level in silence and while speaking, then adjust the threshold range in the source so the full potentiometer travel covers both values.
+**Tuning tip:** The KY-038 has no onboard preamp. Use serial command `2` to read the mic level in silence and while speaking, then adjust potentiometer sensitivity to achieve reliable triggering.
 
 ---
 
@@ -169,7 +209,7 @@ Default login: `admin` / `admin` (change in Settings).
 
 | Endpoint          | Method                                      | Description                |
 | ----------------- | ------------------------------------------- | -------------------------- |
-| `/api/status`     | GET                                         | JSON system status         |
+| `/api/status`     | GET                                         | JSON system status (includes `link_led`: `SetupAp` \| `WifiConnecting` \| `Registering` \| `RegFailed` \| `Idle` \| `Linked`) |
 | `/api/connect`    | POST `{"target":"*ECHOTEST*"}`              | Connect to station         |
 | `/api/disconnect` | POST                                        | Disconnect current station |
 | `/api/dtmf`       | POST `{"command":"*19999#"}`                | Send DTMF command          |
@@ -226,7 +266,8 @@ connect <station>       - Connect to callsign or node number
 d                       - Disconnect
 mode ptt                - Switch to PTT mode
 mode vox                - Switch to VOX mode
-sensitivity <1-9>       - Set VOX sensitivity level
+sensitivity <1-20>      - Set VOX sensitivity level
+vox preroll <0-6>       - Set VOX pre-roll delay (0..120 ms added TX latency in VOX mode)
 say <words>             - Test announcer
 abort                   - Abort current announcement
 set callsign <CALL>     - Set EchoLink callsign
@@ -236,6 +277,7 @@ set name <NAME>         - Set station name
 set location <QTH>      - Set location/frequency
 register                - Force EchoLink registration
 config                  - Print current configuration
+led                     - Print link status LED state and raw inputs
 1                       - Play 1 kHz test tone (PCM5102A)
 2                       - Measure mic level
 3                       - Record (2 s) then play back
@@ -267,8 +309,8 @@ ESP32-microlink/
 │   ├── config_manager.cpp     # NVS Preferences persistence
 │   ├── system_state.cpp       # Shared state (mutex-protected)
 │   ├── echolink_proxy.cpp     # EchoLink proxy protocol
-│   └── echolink_protocol.cpp  # EchoLink RTP/RTCP packet formatting
-├── include/                   # Header files
+├── include/                   # Header files (including vox_pre_roll.h, link_led.h)
+├── test/                      # Unit test suite (test_vox_pre_roll.cpp, test_link_led.cpp)
 ├── data/                      # LittleFS web UI files (HTML/CSS/JS)
 ├── lib/gsm0610/               # GSM 06.10 codec library
 ├── tools/
@@ -307,6 +349,7 @@ All settings stored in ESP32 NVS (non-volatile storage):
 | `proxy_host` | _(empty)_           | Proxy hostname/IP                   |
 | `proxy_port` | `8100`              | Proxy TCP port                      |
 | `proxy_pass` | `PUBLIC`            | Proxy password                      |
+| `vox_pre`    | `3`                 | VOX pre-roll buffer delay in frames (0..6 frames, 20 ms/frame = 0..120 ms added TX latency in VOX mode) |
 
 ---
 
