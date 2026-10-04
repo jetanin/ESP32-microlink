@@ -14,7 +14,7 @@
 - 🌐 **EchoLink Proxy support** — connects through public proxy servers (no open UDP ports required)
 - 🎙️ **PTT and VOX modes** — push-button PTT or voice-activated transmit, selected with a hardware switch (GPIO 23); VOX sensitivity (20 levels) is set with a potentiometer (GPIO 3)
 - ⏳ **VOX Pre-Roll Buffer** — static audio delay line (0..6 frames / 0..120 ms) that prevents initial syllable cutoff during VOX attack time
-- 📡 **DTMF control** — connect/disconnect stations by sending tones from a radio
+- 📡 **DTMF Control & VOX Gate** — connect/disconnect stations by sending tones from a radio with zero tone leakage to VoIP; features a dedicated `DtmfGate` that force-closes VOX immediately upon tone detection and guards inter-digit pauses
 - 📢 **Spoken announcements** — beep-tone chimes for connect/disconnect/mode events (routed to both local speaker and EchoLink TX)
 - 🌍 **Web UI** — responsive mobile-friendly interface for status monitoring, connect/disconnect, settings and favorites management
 - 🔊 **Audio pipeline** — jitter buffer, underflow protection, real-time loopback diagnostics
@@ -94,13 +94,15 @@ The green LED provides visual diagnostic feedback on connectivity and registrati
                │               │    ┌────┴─────────────────┐
     ┌──────────▼──────────┐    │    │     TX PCM FIFO      │ (1280 samples)
     │  audio_playout_task │    │    └────▲─────────────────┘
-    │  (prio 5, I2S DMA)  │    │         │
-    └──────────┬──────────┘    │    ┌────┴─────────────────┐
-               │               │    │  audio_capture_task  │ (prio 4, 50 Hz)
-    ┌──────────▼──────────┐    │    │  ADC DMA capture     │
-    │   PCM5102A DAC      │    │    │  VoxPreRoll (0-6 fr) │
-    │   I2S output        │    │    └────▲─────────────────┘
-    └─────────────────────┘    │         │
+    │  (prio 5, I2S DMA)  │    │         │ (delayed or muted frame)
+    └──────────┬──────────┘    │    ┌────┴──────────────────────────┐
+               │               │    │      audio_capture_task       │ (prio 4, 50 Hz)
+    ┌──────────▼──────────┐    │    │  1. DTMF detector (every fr)  │
+    │   PCM5102A DAC      │    │    │  2. DtmfGate (force-close VOX)│
+    │   I2S output        │    │    │  3. VOX VAD (RMS threshold)   │
+    └─────────────────────┘    │    │  4. VoxPreRoll (0-6 frames)   │
+                               │    └────▲──────────────────────────┘
+                               │         │
                                │    ┌────┴──────┐
                                │    │  KY-038   │
                                │    │  Mic ADC  │
@@ -131,16 +133,31 @@ The green LED provides visual diagnostic feedback on connectivity and registrati
 
 ---
 
-## DTMF Control
+## DTMF Control & VOX Gate
 
 Send DTMF tones from your transceiver to control the node:
 
-| Sequence          | Action                       |
-| ----------------- | ---------------------------- |
-| `*1` + node + `#` | Connect to EchoLink node     |
-| `*2` + node + `#` | Disconnect one station       |
-| `*0#`             | Disconnect all               |
-| `*9#`             | Announce status (beep tones) |
+| Sequence          | Action                       | MicroLink Command Equivalent |
+| ----------------- | ---------------------------- | ---------------------------- |
+| `*1` + node + `#` | Connect to EchoLink node     | `add <node>` / `connect <node>` |
+| `*2` + node + `#` | Disconnect one station       | `drop <node>`                |
+| `*0#`             | Disconnect all               | `dropall`                    |
+| `*9#`             | Announce status (beep tones) | `status`                     |
+
+### DTMF & VOX Coexistence (`DtmfGate`)
+
+In VOX mode, pressing DTMF keys near the microphone would normally open VOX and transmit loud DTMF tones over EchoLink. ESP32-MicroLink solves this with a dedicated, zero-allocation gate (`DtmfGate`) enforcing two invariable rules:
+
+1. **Rule 1 — Detector Invariance:** The Goertzel DTMF detector runs unconditionally on **every** captured 20 ms mic frame (`AUDIO_FRAME_SAMPLES = 160`), before any gain, delay, mute, or VOX gating. Nothing can bypass or pause detection because VOX is open, TX is active, or hang time is running.
+2. **Rule 2 — Immediate VOX Force-Close:** On detection of a DTMF tone candidate, VOX is force-closed **immediately** on that exact frame. There is no waiting for the 600 ms hang timer or the 40 ms attack confirmation timer. If VOX was actively holding TX, it releases TX instantly.
+
+### Audio Muting & Anti-Leak Pipeline
+
+- **Pre-Roll Delay Line Muting:** Because tone recognition requires ~40 ms (2 frames) to confirm, a tone onset could theoretically slip into the pre-roll delay line before confirmation. On every tone candidate rising edge ($0 \rightarrow 1$), `m_vox_pre_roll.muteRecentFrames(2)` zeroes the preceding 40 ms in the buffer so **zero DTMF tone leaks into the VoIP stream**.
+- **100 ms Candidate Guard:** When a tone candidate ends, VOX remains inhibited for an extra 100 ms to bridge tone wobble and inter-digit transitions.
+- **1.5-Second Command Session:** Dialing `*` opens an active command session (`SESSION_TIMEOUT_MS = 1500`). VOX is kept strictly closed across pauses between digits until the command is completed with `#` or times out.
+- **PTT Override & TX Audio Blanking:** If the operator presses DTMF while the hardware PTT button is held down, PTT transmission remains keyed, but the microphone audio is replaced with digital silence (`0`) so control tones are never transmitted over RF/VoIP.
+- **Debounce Protection:** Single authoritative dispatcher, $\ge 60\text{ ms}$ pause re-arming, and a 100 ms rapid identical-digit filter prevent key bounce and duplicate digits.
 
 ---
 
@@ -278,6 +295,10 @@ set location <QTH>      - Set location/frequency
 register                - Force EchoLink registration
 config                  - Print current configuration
 led                     - Print link status LED state and raw inputs
+dtmf <seq>              - Execute DTMF command (e.g. *19999#, *0#)
+dtmf debug on|off       - Toggle live DTMF detector debug prints
+dtmf stats              - Print DTMF & VOX gate diagnostics counters
+dtmf stats reset        - Reset diagnostics counters to zero
 1                       - Play 1 kHz test tone (PCM5102A)
 2                       - Measure mic level
 3                       - Record (2 s) then play back
@@ -309,8 +330,8 @@ ESP32-microlink/
 │   ├── config_manager.cpp     # NVS Preferences persistence
 │   ├── system_state.cpp       # Shared state (mutex-protected)
 │   ├── echolink_proxy.cpp     # EchoLink proxy protocol
-├── include/                   # Header files (including vox_pre_roll.h, link_led.h)
-├── test/                      # Unit test suite (test_vox_pre_roll.cpp, test_link_led.cpp)
+├── include/                   # Header files (dtmf_gate.h, vox_pre_roll.h, link_led.h)
+├── test/                      # Unit test suites (test_dtmf_gate.cpp, test_vox_pre_roll.cpp, test_link_led.cpp)
 ├── data/                      # LittleFS web UI files (HTML/CSS/JS)
 ├── lib/gsm0610/               # GSM 06.10 codec library
 ├── tools/

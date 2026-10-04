@@ -72,19 +72,19 @@ inline const char *linkLedName(LinkLed state)
     switch (state)
     {
     case LinkLed::SetupAp:
-        return "setup_ap";
+        return "SetupAp";
     case LinkLed::WifiConnecting:
-        return "wifi_connecting";
+        return "WifiConnecting";
     case LinkLed::Registering:
-        return "registering";
+        return "Registering";
     case LinkLed::RegFailed:
-        return "reg_failed";
+        return "RegFailed";
     case LinkLed::Idle:
-        return "idle";
+        return "Idle";
     case LinkLed::Linked:
-        return "linked";
+        return "Linked";
     default:
-        return "unknown";
+        return "Unknown";
     }
 }
 

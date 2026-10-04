@@ -144,6 +144,7 @@ static void echolink_task(void *pvParameters)
                     {
                         Serial.println(F("[EchoLink] Connecting to Addressing Server for registration..."));
                     }
+                    system_state_set_reg_failed(false);
                     system_state_set_echolink(EchoLinkState::CONNECTING_DIR);
                     if (addressing_server_logon())
                     {
@@ -1190,7 +1191,6 @@ static void service_tx_audio()
             size_t got = audio_pipeline_read_samples(s_tx_pcm_buf + s_tx_pcm_samples_accum, needed, 0);
             if (got == 0)
                 break;
-            dtmf_detector_process(s_tx_pcm_buf + s_tx_pcm_samples_accum, got);
             s_tx_pcm_samples_accum += got;
 
             if (s_tx_pcm_samples_accum >= GSM_BUNDLE_SAMPLES)

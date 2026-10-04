@@ -124,6 +124,28 @@ public:
         return true;
     }
 
+    /**
+     * @brief Zero out the most recently written n frames in the pre-roll buffer.
+     * Used when a DTMF tone candidate is detected to prevent the onset of the tone
+     * that was already buffered from leaking to TX.
+     */
+    void muteRecentFrames(uint8_t n)
+    {
+        if (n > MAX_FRAMES)
+        {
+            n = static_cast<uint8_t>(MAX_FRAMES);
+        }
+        if (n > m_count)
+        {
+            n = m_count;
+        }
+        for (uint8_t i = 0; i < n; i++)
+        {
+            size_t idx = (m_write_idx + MAX_FRAMES - 1 - i) % MAX_FRAMES;
+            memset(m_buffer[idx], 0, FRAME_SAMPLES * sizeof(int16_t));
+        }
+    }
+
 private:
     int16_t m_buffer[MAX_FRAMES][FRAME_SAMPLES]; // 8 * 160 * 2 = 2560 bytes static
     uint8_t m_delay_frames;

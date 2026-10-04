@@ -48,6 +48,9 @@ public:
     void set_vox_preroll_delay(uint8_t delay_frames);
     uint8_t get_vox_preroll_delay() const;
     void request_vox_reset();
+    bool is_vox_tx_open() const { return m_vox_tx_open; }
+    void force_close_vox();
+    void reset_vox();
 
     JitterBuffer& get_jitter_buffer() { return m_jitter_buffer; }
     JitterBufferStats get_stats() { return m_jitter_buffer.get_stats(); }
@@ -64,6 +67,11 @@ private:
     std::atomic<uint8_t> m_req_preroll_delay;
     std::atomic<bool> m_delay_change_pending;
     std::atomic<bool> m_reset_pending;
+
+    // VOX State (managed synchronously within audio_capture_task)
+    volatile bool m_vox_tx_open;
+    uint32_t m_speech_start_time;
+    uint32_t m_vox_hang_end;
 
     // Static TX PCM FIFO connecting audio_capture_task to service_tx_audio
     static constexpr size_t TX_FIFO_CAPACITY = 1280; // 8 frames = 160 ms @ 8 kHz
@@ -96,4 +104,8 @@ void audio_pipeline_clear_tx();
 void audio_pipeline_set_vox_preroll_delay(uint8_t delay_frames);
 uint8_t audio_pipeline_get_vox_preroll_delay();
 void audio_pipeline_request_vox_reset();
+bool audio_pipeline_is_vox_open();
+void audio_pipeline_force_close_vox();
+void audio_pipeline_reset_vox();
+
 

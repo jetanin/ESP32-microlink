@@ -1,5 +1,6 @@
 #include "dtmf_controller.h"
 #include "dtmf_detector.h"
+#include "dtmf_gate.h"
 #include "echolink_client.h"
 #include "system_state.h"
 #include "audio_pipeline.h"
@@ -36,6 +37,17 @@ void DTMFController::clear_buffer()
 void DTMFController::handle_digit(char digit)
 {
     if (m_playing_feedback) return;
+
+    // Debounce guard: reject duplicate identical digit within 100 ms
+    static uint32_t s_last_digit_time = 0;
+    static char s_last_handled_digit = '\0';
+    uint32_t now = millis();
+    if (digit == s_last_handled_digit && (uint32_t)(now - s_last_digit_time) < 100)
+    {
+        return;
+    }
+    s_last_handled_digit = digit;
+    s_last_digit_time = now;
 
     Serial.printf("[DTMF] >>> Digit Detected: '%c'\n", digit);
 
@@ -74,6 +86,7 @@ void DTMFController::handle_digit(char digit)
             else
             {
                 Serial.println(F("[DTMF] Buffer overflow, sequence reset."));
+                dtmf_gate_instance().record_command_rejected("buffer_overflow");
                 clear_buffer();
             }
         }
@@ -157,12 +170,14 @@ bool DTMFController::handle_command(const char *command_str)
     if (parsed.action != DTMFActionType::NONE)
     {
         m_last_action = parsed.action;
+        dtmf_gate_instance().record_command_dispatched();
         execute_action(parsed);
         return true;
     }
     else
     {
         Serial.printf("[DTMF] Unknown command format: '%s'\n", p);
+        dtmf_gate_instance().record_command_rejected("unknown_format");
         play_feedback(DTMFActionType::NONE, false);
         return false;
     }
@@ -340,3 +355,10 @@ const char* dtmf_controller_get_last_command()
 {
     return s_controller.get_last_command();
 }
+
+bool dtmf_controller_in_progress()
+{
+    const char *buf = dtmf_controller_get_buffer();
+    return (buf && buf[0] != '\0');
+}
+

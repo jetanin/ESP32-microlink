@@ -65,12 +65,12 @@ static void testPickLinkLed()
     }
 
     // Verify string names
-    assert(std::string(linkLedName(LinkLed::SetupAp)) == "setup_ap");
-    assert(std::string(linkLedName(LinkLed::WifiConnecting)) == "wifi_connecting");
-    assert(std::string(linkLedName(LinkLed::Registering)) == "registering");
-    assert(std::string(linkLedName(LinkLed::RegFailed)) == "reg_failed");
-    assert(std::string(linkLedName(LinkLed::Idle)) == "idle");
-    assert(std::string(linkLedName(LinkLed::Linked)) == "linked");
+    assert(std::string(linkLedName(LinkLed::SetupAp)) == "SetupAp");
+    assert(std::string(linkLedName(LinkLed::WifiConnecting)) == "WifiConnecting");
+    assert(std::string(linkLedName(LinkLed::Registering)) == "Registering");
+    assert(std::string(linkLedName(LinkLed::RegFailed)) == "RegFailed");
+    assert(std::string(linkLedName(LinkLed::Idle)) == "Idle");
+    assert(std::string(linkLedName(LinkLed::Linked)) == "Linked");
 
     std::cout << "PASSED\n";
 }

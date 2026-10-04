@@ -1,7 +1,12 @@
 #include "dtmf_detector.h"
 #include "dtmf_controller.h"
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 // Pre-computed Goertzel coefficients for 8000 Hz sample rate:
 // coeff = 2 * cos(2 * pi * f / 8000)
@@ -63,9 +68,10 @@ void DTMFDetector::reset()
     m_reported = false;
 }
 
-char DTMFDetector::process_frame_160(const int16_t *samples)
+DtmfFrameResult DTMFDetector::process_frame(const int16_t *samples)
 {
-    if (!m_enabled || !samples) return '\0';
+    DtmfFrameResult result = {false, '\0', '\0'};
+    if (!m_enabled || !samples) return result;
 
     // Fast integer peak check first! If the signal amplitude is low (silence / quiet),
     // skip Goertzel completely to save CPU on ESP32-C6 single-core RISC-V.
@@ -85,7 +91,7 @@ char DTMFDetector::process_frame_160(const int16_t *samples)
             m_tone_hits = 0;
             m_reported = false;
         }
-        return '\0';
+        return result;
     }
 
     if (!s_hamming_initialized)
@@ -186,6 +192,12 @@ char DTMFDetector::process_frame_160(const int16_t *samples)
         detected = DTMF_MAP[row_best][col_best - 4];
     }
 
+    if (detected != '\0')
+    {
+        result.candidate = true;
+        result.candidate_char = detected;
+    }
+
     // Debouncing & Confirmation State Machine (Requires >= 40 ms tone + >= 40 ms pause)
     char confirmed_digit = '\0';
     if (detected != '\0')
@@ -216,7 +228,7 @@ char DTMFDetector::process_frame_160(const int16_t *samples)
     else
     {
         m_pause_hits++;
-        if (m_pause_hits >= 2) // 40 ms of pause/silence
+        if (m_pause_hits >= 3) // 60 ms of pause/silence before same digit can re-arm
         {
             m_candidate_char = '\0';
             m_tone_hits = 0;
@@ -224,7 +236,13 @@ char DTMFDetector::process_frame_160(const int16_t *samples)
         }
     }
 
-    return confirmed_digit;
+    result.confirmed_digit = confirmed_digit;
+    return result;
+}
+
+char DTMFDetector::process_frame_160(const int16_t *samples)
+{
+    return process_frame(samples).confirmed_digit;
 }
 
 void DTMFDetector::process(const int16_t *samples, size_t count)
@@ -234,7 +252,7 @@ void DTMFDetector::process(const int16_t *samples, size_t count)
     size_t offset = 0;
     while (offset + 160 <= count)
     {
-        process_frame_160(samples + offset);
+        process_frame(samples + offset);
         offset += 160;
     }
 }
@@ -243,12 +261,19 @@ void DTMFDetector::process(const int16_t *samples, size_t count)
 void dtmf_detector_init()
 {
     s_detector.init();
-    s_detector.set_digit_callback(dtmf_controller_handle_digit);
+    // Do NOT register dtmf_controller_handle_digit as m_callback here.
+    // audio_capture_task is the single dispatcher for captured frames.
+    s_detector.set_digit_callback(nullptr);
 }
 
 void dtmf_detector_process(const int16_t *samples, size_t count)
 {
     s_detector.process(samples, count);
+}
+
+DtmfFrameResult dtmf_detector_process_frame(const int16_t *samples)
+{
+    return s_detector.process_frame(samples);
 }
 
 void dtmf_detector_reset()

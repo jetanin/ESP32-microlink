@@ -1,6 +1,8 @@
 #pragma once
 
+#ifdef ARDUINO
 #include <Arduino.h>
+#endif
 #include <cstdint>
 #include <cstddef>
 
@@ -14,6 +16,12 @@
  */
 
 typedef void (*DTMFDigitCallback)(char digit);
+
+struct DtmfFrameResult {
+    bool candidate;       // Fast 1-frame tone pair detected
+    char candidate_char;  // Tone pair character, e.g. '1', '*', or '\0'
+    char confirmed_digit; // Debounced confirmed digit, or '\0'
+};
 
 class DTMFDetector {
 public:
@@ -36,7 +44,12 @@ public:
 
     /**
      * @brief Process a single 20 ms frame (160 samples at 8 kHz).
-     * @return Detected character if confirmed on this frame, or '\0'
+     * @return DtmfFrameResult containing candidate and confirmed digit info.
+     */
+    DtmfFrameResult process_frame(const int16_t *samples);
+
+    /**
+     * @brief Legacy single-frame processing returning confirmed digit.
      */
     char process_frame_160(const int16_t *samples);
 
@@ -62,6 +75,7 @@ private:
 // Global instance functions
 void dtmf_detector_init();
 void dtmf_detector_process(const int16_t *samples, size_t count);
+DtmfFrameResult dtmf_detector_process_frame(const int16_t *samples);
 void dtmf_detector_reset();
 void dtmf_detector_set_enabled(bool enabled);
 bool dtmf_detector_is_enabled();

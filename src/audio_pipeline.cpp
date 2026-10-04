@@ -1,12 +1,20 @@
 #include "audio_pipeline.h"
 #include "system_state.h"
 #include "dtmf_detector.h"
+#include "dtmf_controller.h"
+#include "dtmf_gate.h"
 #include "announcer.h"
 #include "echolink_client.h"
 #include <cmath>
 
 static constexpr UBaseType_t TASK_PRIO_AUDIO_PLAYOUT = 5; // Highest system priority
 static constexpr UBaseType_t TASK_PRIO_AUDIO_CAPTURE = 4;
+
+static DtmfGate s_dtmf_gate;
+DtmfGate &dtmf_gate_instance()
+{
+    return s_dtmf_gate;
+}
 
 AudioPipeline *AudioPipeline::s_instance = nullptr;
 
@@ -18,6 +26,9 @@ AudioPipeline::AudioPipeline(AudioIn &audio_in, AudioOut &audio_out)
       m_req_preroll_delay(3),
       m_delay_change_pending(false),
       m_reset_pending(false),
+      m_vox_tx_open(false),
+      m_speech_start_time(0),
+      m_vox_hang_end(0),
       m_tx_fifo_head(0),
       m_tx_fifo_tail(0),
       m_tx_fifo_count(0),
@@ -274,6 +285,28 @@ void AudioPipeline::audio_playout_task(void *pvParameters)
     }
 }
 
+void AudioPipeline::force_close_vox()
+{
+    m_speech_start_time = 0;
+    m_vox_hang_end = 0;
+    if (m_vox_tx_open)
+    {
+        m_vox_tx_open = false;
+        if (echolink_client_get_tx_source() == TxSource::VOX)
+        {
+            echolink_client_tx_release(TxSource::VOX);
+            system_state_set_ptt(false);
+            Serial.println(F("[VOX] TX force-closed"));
+        }
+    }
+}
+
+void AudioPipeline::reset_vox()
+{
+    force_close_vox();
+    m_vox_pre_roll.reset();
+}
+
 void AudioPipeline::audio_capture_task(void *pvParameters)
 {
     auto *pipeline = static_cast<AudioPipeline *>(pvParameters);
@@ -301,7 +334,7 @@ void AudioPipeline::audio_capture_task(void *pvParameters)
             {
                 frame.seq = seq++;
                 pipeline->m_jitter_buffer.push_frame(frame);
-                dtmf_detector_process(frame.samples, AUDIO_FRAME_SAMPLES);
+                dtmf_detector_process_frame(frame.samples);
             }
         }
         else
@@ -311,14 +344,52 @@ void AudioPipeline::audio_capture_task(void *pvParameters)
             size_t read_cnt = pipeline->m_audio_in.read_samples(mic_frame, AUDIO_FRAME_SAMPLES, pdMS_TO_TICKS(50));
             if (read_cnt == AUDIO_FRAME_SAMPLES)
             {
-                SystemState st = system_state_get();
+                uint32_t now = millis();
 
-                // Process DTMF if not transmitting and announcer not busy/inhibited
-                if (!st.tx_active && !announcer_is_vox_inhibited())
+                // 1. DTMF detector runs on EVERY captured mic frame, independent of
+                //    VOX state, TX state, and mode (PTT/VOX).
+                DtmfFrameResult res = dtmf_detector_process_frame(mic_frame);
+
+                // 2. Dispatch confirmed digits to DTMF controller immediately
+                //    (inhibit only if local speaker is playing an announcement to avoid acoustic feedback)
+                if (res.confirmed_digit != '\0')
                 {
-                    dtmf_detector_process(mic_frame, AUDIO_FRAME_SAMPLES);
+                    if (!announcer_is_vox_inhibited())
+                    {
+                        dtmf_controller_handle_digit(res.confirmed_digit);
+                    }
                 }
 
+                // 3. Update DtmfGate with per-frame candidate and confirmed digit
+                s_dtmf_gate.update(res.candidate, res.confirmed_digit, dtmf_controller_in_progress(), now);
+
+                // Rising edge of candidate: zero newest 2 frames in pre-roll buffer
+                // so the onset of the tone buffered before detection does not leak into TX.
+                if (s_dtmf_gate.is_candidate_rising(res.candidate))
+                {
+                    pipeline->m_vox_pre_roll.muteRecentFrames(2);
+                }
+
+                // Periodic or on-event debug logging if enabled
+                if (s_dtmf_gate.is_debug() && (res.candidate || res.confirmed_digit != '\0'))
+                {
+                    SystemState st_dbg = system_state_get();
+                    Serial.printf("[dtmf] cand=%d conf=%d digit=%c tx=%d vox=%d pp=%u\n",
+                                  res.candidate ? 1 : 0,
+                                  res.confirmed_digit != '\0' ? 1 : 0,
+                                  res.confirmed_digit != '\0' ? res.confirmed_digit : '-',
+                                  st_dbg.tx_active ? 1 : 0,
+                                  (st_dbg.op_mode == 1) ? 1 : 0,
+                                  (unsigned int)pipeline->m_vox_pre_roll.getBufferedCount());
+                }
+
+                // Rule 2: Force-close VOX immediately on tone detection (no hang or attack wait)
+                if (s_dtmf_gate.should_force_close_vox())
+                {
+                    pipeline->force_close_vox();
+                }
+
+                SystemState st = system_state_get();
                 bool is_vox = (st.op_mode == 1);
                 bool tx_active = echolink_client_is_tx_active();
                 TxSource tx_src = echolink_client_get_tx_source();
@@ -331,30 +402,90 @@ void AudioPipeline::audio_capture_task(void *pvParameters)
 
                 if (is_vox)
                 {
+                    // 4. VOX Mode: evaluate level, attack, and hang (if not inhibited by gate, TOT, or announcer)
+                    if (!s_dtmf_gate.is_vox_inhibited() && !st.tot_triggered && !announcer_is_vox_inhibited())
+                    {
+                        uint16_t moving_rms = pipeline->m_audio_in.get_moving_rms();
+                        uint8_t sens = st.vox_sensitivity;
+                        if (sens < 1) sens = 1;
+                        if (sens > 20) sens = 20;
+                        uint16_t threshold = VOX_THRESHOLDS[sens];
+                        bool voice_active = (moving_rms >= threshold);
+
+                        if (voice_active)
+                        {
+                            if (pipeline->m_speech_start_time == 0)
+                            {
+                                pipeline->m_speech_start_time = now;
+                            }
+                            if (!pipeline->m_vox_tx_open && (now - pipeline->m_speech_start_time >= VOX_ATTACK_MS))
+                            {
+                                pipeline->m_vox_tx_open = true;
+                                if (echolink_client_tx_request(TxSource::VOX))
+                                {
+                                    system_state_set_ptt(true);
+                                    Serial.printf("[VOX] >>> TX OPENED (Moving RMS=%u >= Threshold=%u, sens=%u/20)\n",
+                                                  moving_rms, threshold, sens);
+                                }
+                            }
+                            pipeline->m_vox_hang_end = now + VOX_HANG_MS;
+                        }
+                        else
+                        {
+                            pipeline->m_speech_start_time = 0;
+                        }
+
+                        if (pipeline->m_vox_tx_open && now >= pipeline->m_vox_hang_end)
+                        {
+                            pipeline->m_vox_tx_open = false;
+                            pipeline->m_speech_start_time = 0;
+                            echolink_client_tx_release(TxSource::VOX);
+                            system_state_set_ptt(false);
+                            Serial.println(F("[VOX] TX closed (hang timer expired)"));
+                        }
+                    }
+                    else
+                    {
+                        if (pipeline->m_vox_tx_open)
+                        {
+                            pipeline->force_close_vox();
+                        }
+                    }
+
                     // VOX Mode: push newest frame into VoxPreRoll delay line
                     int16_t delayed_frame[AUDIO_FRAME_SAMPLES];
                     bool primed = pipeline->m_vox_pre_roll.push(mic_frame, delayed_frame);
+
+                    tx_active = echolink_client_is_tx_active();
+                    tx_src = echolink_client_get_tx_source();
 
                     if (tx_active && (tx_src == TxSource::VOX))
                     {
                         // Once VOX is open, write delayed frame to TX FIFO (skip if not primed yet)
                         if (primed)
                         {
+                            if (s_dtmf_gate.should_mute_tx())
+                            {
+                                memset(delayed_frame, 0, sizeof(delayed_frame));
+                            }
                             pipeline->tx_fifo_write(delayed_frame, AUDIO_FRAME_SAMPLES);
                         }
-                    }
-                    else
-                    {
-                        // While VOX is closed, frames only circulate in pre-roll buffer.
-                        // Leftover frames when VOX closes are post-speech silence and discarded.
                     }
                 }
                 else
                 {
-                    // PTT Mode: bypass pre-roll buffer completely (0 added latency)
+                    // 5. PTT Mode: bypass pre-roll buffer completely (0 added latency)
                     if (tx_active && (tx_src == TxSource::PTT_BUTTON))
                     {
-                        pipeline->tx_fifo_write(mic_frame, AUDIO_FRAME_SAMPLES);
+                        if (s_dtmf_gate.should_mute_tx())
+                        {
+                            int16_t silence[AUDIO_FRAME_SAMPLES] = {0};
+                            pipeline->tx_fifo_write(silence, AUDIO_FRAME_SAMPLES);
+                        }
+                        else
+                        {
+                            pipeline->tx_fifo_write(mic_frame, AUDIO_FRAME_SAMPLES);
+                        }
                     }
                 }
             }
@@ -423,4 +554,24 @@ void audio_pipeline_request_vox_reset()
     if (AudioPipeline::instance())
         AudioPipeline::instance()->request_vox_reset();
 }
+
+bool audio_pipeline_is_vox_open()
+{
+    if (AudioPipeline::instance())
+        return AudioPipeline::instance()->is_vox_tx_open();
+    return false;
+}
+
+void audio_pipeline_force_close_vox()
+{
+    if (AudioPipeline::instance())
+        AudioPipeline::instance()->force_close_vox();
+}
+
+void audio_pipeline_reset_vox()
+{
+    if (AudioPipeline::instance())
+        AudioPipeline::instance()->reset_vox();
+}
+
 

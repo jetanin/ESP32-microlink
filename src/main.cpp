@@ -29,6 +29,7 @@
 #include "echolink_protocol.h"
 #include "dtmf_controller.h"
 #include "dtmf_detector.h"
+#include "dtmf_gate.h"
 #include "announcer.h"
 #include "link_led.h"
 
@@ -80,37 +81,7 @@ enum class OperatingMode : uint8_t
     VOX
 };
 
-// VOX Sensitivity mapping: step 1-20 -> Moving Energy / RMS threshold (12-bit AC scale)
-// Subdivided into 20 granular steps for precise threshold adjustment.
-// Ambient noise floor: ~10-20 RMS. Speaking voice: ~70-200 RMS. Shouting: ~300+ RMS.
-// Higher step = more sensitive (triggers on quieter signals)
-static constexpr uint16_t VOX_THRESHOLDS[21] = {
-    0,   // unused (index 0)
-    420, // step 1 - least sensitive (loud shout)
-    370, // step 2
-    325, // step 3
-    285, // step 4
-    250, // step 5
-    220, // step 6
-    195, // step 7
-    170, // step 8
-    150, // step 9
-    130, // step 10 - medium (default, normal speech)
-    112, // step 11
-    96,  // step 12
-    82,  // step 13
-    70,  // step 14
-    58,  // step 15
-    48,  // step 16
-    39,  // step 17
-    31,  // step 18
-    24,  // step 19
-    18,  // step 20 - most sensitive (quiet whisper)
-};
-
-static constexpr uint32_t TOT_MAX_MS = 60000;  // 60 s TX limit
-static constexpr uint32_t VOX_HANG_MS = 600;   // hold TX open after speech stops (600 ms hang time)
-static constexpr uint32_t VOX_OPEN_FRAMES = 2; // consecutive active frames to open VOX
+static constexpr uint32_t TOT_MAX_MS = 60000; // 60 s TX limit
 
 static OperatingMode s_op_mode = OperatingMode::PTT;
 static uint8_t s_current_sensitivity = 10;
@@ -118,11 +89,6 @@ static uint8_t s_last_announced_sensitivity = 0;
 static uint32_t s_pot_stable_start = 0;
 static uint32_t s_last_sensitivity_announce_time = 0;
 static uint8_t s_last_raw_pot_step = 10;
-
-// VOX Voice-Activity Detector state
-static bool s_vox_tx_open = false;   // Is VOX currently holding TX?
-static uint32_t s_vox_hang_end = 0;  // Time when hang timer expires
-static uint8_t s_vox_open_count = 0; // Consecutive active frames counter
 
 // TOT state (shared between PTT and VOX modes)
 static bool s_tot_triggered = false; // TRUE when TOT has fired and TX was cut
@@ -142,9 +108,7 @@ static void switch_mode(OperatingMode new_mode)
     echolink_client_tx_force_off();
 
     // Reset VOX state on mode change
-    s_vox_tx_open = false;
-    s_vox_hang_end = 0;
-    s_vox_open_count = 0;
+    s_pipeline.reset_vox();
     s_tot_triggered = false;
     s_tx_was_active = false;
 
@@ -226,6 +190,19 @@ void setup()
     // Sync initial mode to system state (must be after system_state_init)
     system_state_set_mode((uint8_t)s_op_mode, s_current_sensitivity);
 
+    // Spawn status task immediately so LED patterns run during WiFi and EchoLink connection
+    BaseType_t res = xTaskCreate(
+        status_button_task,
+        "sys_status_task",
+        3072,
+        nullptr,
+        TASK_PRIO_SYSTEM,
+        nullptr);
+    if (res != pdPASS)
+    {
+        Serial.println(F("[ERROR] Failed to create sys_status_task!"));
+    }
+
     print_banner();
 
     // 2. Initialize Audio Pipeline & Jitter Buffer
@@ -291,24 +268,6 @@ void setup()
     else
     {
         Announcer::instance().announceVoxMode();
-    }
-
-    // 8. Spawn background task for button polling and system supervision
-    BaseType_t res = xTaskCreate(
-        status_button_task,
-        "sys_status_task",
-        3072,
-        nullptr,
-        TASK_PRIO_SYSTEM,
-        nullptr);
-
-    if (res != pdPASS)
-    {
-        Serial.println(F("[ERROR] Failed to create sys_status_task!"));
-    }
-    else
-    {
-        Serial.println(F("[SYS] sys_status_task running (Priority: 2, Core: 0)"));
     }
 
     Serial.println(F("============================================================"));
@@ -422,12 +381,7 @@ void loop()
                 if (Announcer::instance().busy())
                     Announcer::instance().abort();
                 echolink_client_tx_force_off();
-                if (s_vox_tx_open)
-                {
-                    s_vox_tx_open = false;
-                    s_vox_hang_end = 0;
-                    s_vox_open_count = 0;
-                }
+                s_pipeline.force_close_vox();
                 digitalWrite(PIN_LED_RED, LOW);
                 s_tot_triggered = true;
                 system_state_set_tot(true);
@@ -478,74 +432,21 @@ void loop()
     }
 
     // =========================================================================
-    // 6. VOX Voice Activity Detector (only when in VOX mode, not TOT-locked)
+    // 6. VOX Periodic Status (VOX detector runs synchronously in audio_capture_task)
     // =========================================================================
-    if (s_op_mode == OperatingMode::VOX && !s_tot_triggered && !Announcer::instance().is_vox_inhibited())
+    if (s_op_mode == OperatingMode::VOX)
     {
-        // Read smoothed moving energy / RMS (calculated over a 4-frame / 80 ms sliding window in AdcAudioIn)
-        uint16_t moving_rms = s_audio_in.get_moving_rms();
-        uint16_t threshold = VOX_THRESHOLDS[s_current_sensitivity];
-        bool voice_active = (moving_rms >= threshold);
-
-        // Attack time tracker: signal must be sustained for >= 40 ms (filters out brief click spikes)
-        static uint32_t s_speech_start_time = 0;
-
-        // Periodic VOX debug print (every 2 s) — shows live mic RMS, threshold and pot reading
         static uint32_t vox_debug_ts = 0;
         if (now - vox_debug_ts >= 2000)
         {
             vox_debug_ts = now;
+            uint16_t moving_rms = s_audio_in.get_moving_rms();
+            uint16_t threshold = VOX_THRESHOLDS[s_current_sensitivity];
             Serial.printf("[VOX] RMS=%u | Threshold=%u (sens=%u/20) | TX=%s | Pot raw=%u step=%u\n",
                           moving_rms, threshold, s_current_sensitivity,
-                          s_vox_tx_open ? "OPEN" : "idle",
+                          s_pipeline.is_vox_tx_open() ? "OPEN" : "idle",
                           s_audio_in.get_pot_raw(), s_audio_in.get_pot_step());
         }
-
-        if (voice_active)
-        {
-            if (s_speech_start_time == 0)
-            {
-                s_speech_start_time = now;
-            }
-
-            // Attack time verification: signal must stay above threshold for >= 40 ms (2 frames)
-            // This prevents short clicks/pops/spikes from keying the transmitter
-            if (!s_vox_tx_open && (now - s_speech_start_time >= 40))
-            {
-                s_vox_tx_open = true;
-                if (echolink_client_tx_request(TxSource::VOX))
-                {
-                    system_state_set_ptt(true);
-                    Serial.printf("[VOX] >>> TX OPENED (Moving RMS=%u >= Threshold=%u, sens=%u/20)\n",
-                                  moving_rms, threshold, s_current_sensitivity);
-                }
-            }
-            // Refresh hang timer while speech continues
-            s_vox_hang_end = now + VOX_HANG_MS;
-        }
-        else
-        {
-            // Reset speech start time if signal drops below threshold
-            s_speech_start_time = 0;
-        }
-
-        // Close VOX after hang time expires
-        if (s_vox_tx_open && now >= s_vox_hang_end)
-        {
-            s_vox_tx_open = false;
-            s_speech_start_time = 0;
-            echolink_client_tx_release(TxSource::VOX);
-            system_state_set_ptt(false);
-            Serial.println(F("[VOX] TX closed (hang timer expired)"));
-        }
-    }
-    else if (s_op_mode != OperatingMode::VOX && s_vox_tx_open)
-    {
-        // Mode changed while VOX was open — close cleanly
-        s_vox_tx_open = false;
-        s_vox_open_count = 0;
-        echolink_client_tx_release(TxSource::VOX);
-        system_state_set_ptt(false);
     }
 
     // =========================================================================
@@ -645,11 +546,47 @@ void loop()
         {
             dtmf_controller_handle_command(line.c_str());
         }
-        else if (line.startsWith("dtmf "))
+        else if (line.startsWith("dtmf ") || line.equalsIgnoreCase("dtmf"))
         {
-            String val = line.substring(5);
-            val.trim();
-            dtmf_controller_handle_command(val.c_str());
+            String val = "";
+            if (line.length() > 5)
+            {
+                val = line.substring(5);
+                val.trim();
+            }
+
+            if (val.equalsIgnoreCase("debug on"))
+            {
+                dtmf_gate_instance().set_debug(true);
+                Serial.println(F("[DTMF] Debug logging ENABLED"));
+            }
+            else if (val.equalsIgnoreCase("debug off"))
+            {
+                dtmf_gate_instance().set_debug(false);
+                Serial.println(F("[DTMF] Debug logging DISABLED"));
+            }
+            else if (val.equalsIgnoreCase("stats") || val.equalsIgnoreCase("stat"))
+            {
+                const DtmfStats &st = dtmf_gate_instance().get_stats();
+                Serial.println(F("--- DTMF & VOX Gate Statistics ---"));
+                Serial.printf("Frames analyzed:     %lu\n", (unsigned long)st.frames_analyzed);
+                Serial.printf("Candidate frames:    %lu\n", (unsigned long)st.candidate_frames);
+                Serial.printf("Confirmed digits:    %lu\n", (unsigned long)st.confirmed_digits);
+                Serial.printf("VOX force-closes:    %lu\n", (unsigned long)st.vox_force_closes);
+                Serial.printf("Commands dispatched: %lu\n", (unsigned long)st.commands_dispatched);
+                Serial.printf("Commands rejected:   %lu\n", (unsigned long)st.commands_rejected);
+                Serial.printf("Last reject reason:  %s\n", strlen(st.last_reject_reason) > 0 ? st.last_reject_reason : "none");
+                Serial.println(F("----------------------------------"));
+            }
+            else if (val.equalsIgnoreCase("stats reset") || val.equalsIgnoreCase("reset stats"))
+            {
+                dtmf_gate_instance().reset_stats();
+                Serial.println(F("[DTMF] Statistics reset to zero"));
+            }
+            else
+            {
+                dtmf_controller_handle_command(val.c_str());
+            }
         }
         else if (line.startsWith("add "))
         {
@@ -853,6 +790,9 @@ void loop()
             Serial.println(F(" '2'                      - Measure KY-038 mic level"));
             Serial.println(F(" '3'                      - 2-second record and playback"));
             Serial.println(F(" '4'                      - Toggle Real-time local loopback"));
+            Serial.println(F(" 'dtmf <seq>'             - Execute DTMF command (e.g. *19999#, *0#)"));
+            Serial.println(F(" 'dtmf debug on|off'      - Toggle live DTMF detector debug prints"));
+            Serial.println(F(" 'dtmf stats'             - Print DTMF & VOX gate counters"));
             Serial.println(F(" 'j'                      - Print Jitter Buffer statistics"));
             Serial.println(F(" 's'                      - Print system status summary"));
             Serial.println(F(" 'h'                      - Show help\n"));
@@ -978,12 +918,18 @@ static void status_button_task(void *pvParameters)
         static bool s_link_led_inited = false;
         static int s_last_pin_level = -1;
 
+        bool wifi_connected = (st.wifi_state == WifiState::CONNECTED) && wifi_manager_is_connected();
+        if (!wifi_connected && st.wifi_state == WifiState::CONNECTED)
+        {
+            system_state_set_wifi(WifiState::CONNECTING);
+        }
+
         LinkInputs link_in;
         link_in.apMode = (st.wifi_state == WifiState::AP_MODE);
-        link_in.wifiUp = (st.wifi_state == WifiState::CONNECTED);
+        link_in.wifiUp = wifi_connected;
         link_in.regFailed = st.reg_failed;
-        link_in.registered = (st.echolink_state == EchoLinkState::LOGGED_IN);
-        link_in.linked = (st.station_state == StationState::CONNECTED);
+        link_in.registered = (st.echolink_state == EchoLinkState::LOGGED_IN) && wifi_connected;
+        link_in.linked = (st.station_state == StationState::CONNECTED) && wifi_connected;
 
         LinkLed cur_led = pickLinkLed(link_in);
         if (!s_link_led_inited || cur_led != s_last_link_led)

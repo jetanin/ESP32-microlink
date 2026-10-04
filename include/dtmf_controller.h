@@ -1,6 +1,8 @@
 #pragma once
 
+#ifdef ARDUINO
 #include <Arduino.h>
+#endif
 #include <cstdint>
 #include <cstddef>
 
@@ -73,3 +75,5 @@ bool dtmf_controller_handle_command(const char *cmd);
 bool dtmf_controller_is_playing_feedback();
 const char* dtmf_controller_get_buffer();
 const char* dtmf_controller_get_last_command();
+bool dtmf_controller_in_progress();
+
