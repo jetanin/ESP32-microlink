@@ -32,14 +32,14 @@ void config_manager_init()
     String loc = s_prefs_config.getString("location", "Bangkok, Thailand");
     String w_u = s_prefs_config.getString("web_user", "admin");
     String w_p = s_prefs_config.getString("web_pass", "admin");
-    bool   p_en = s_prefs_config.getBool("proxy_en", false);
+    bool p_en = s_prefs_config.getBool("proxy_en", false);
     String p_host = s_prefs_config.getString("proxy_host", "");
     uint16_t p_port = s_prefs_config.getUShort("proxy_port", 8100);
     String p_pass = s_prefs_config.getString("proxy_pass", "PUBLIC");
-    uint8_t vox_pre = s_prefs_config.getUChar("vox_pre", 3);
+    uint8_t vox_pre = s_prefs_config.getUChar("vox_pre", 4);
     if (vox_pre > 6)
     {
-        vox_pre = 3;
+        vox_pre = 4;
     }
 
     strncpy(s_cached_config.wifi_ssid, ssid.c_str(), sizeof(s_cached_config.wifi_ssid) - 1);

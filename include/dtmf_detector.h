@@ -8,7 +8,7 @@
 
 /**
  * @file dtmf_detector.h
- * @brief Real-time DSP DTMF Tone Detector using Goertzel Algorithm (8 kHz sample rate)
+ * @brief Real-time DSP DTMF Tone Detector using Integer Goertzel Algorithm (8 kHz sample rate)
  *
  * Standard DTMF Frequencies:
  * Low Group  (Rows)   : 697 Hz, 770 Hz, 852 Hz, 941 Hz
@@ -17,13 +17,32 @@
 
 typedef void (*DTMFDigitCallback)(char digit);
 
-struct DtmfFrameResult {
-    bool candidate;       // Fast 1-frame tone pair detected
-    char candidate_char;  // Tone pair character, e.g. '1', '*', or '\0'
-    char confirmed_digit; // Debounced confirmed digit, or '\0'
+enum class DtmfRejectReason : uint8_t
+{
+    None = 0,
+    EnergyLow,
+    LowDominance,
+    HighDominance,
+    EnergyRatio,
+    Harm2,
+    Twist,
+    FrequencyInstability,
+    AmplitudeInstability
 };
 
-class DTMFDetector {
+const char *dtmf_reject_reason_str(DtmfRejectReason reason);
+
+struct DtmfFrameResult
+{
+    bool candidate;                 // Fast 1-frame tone pair detected
+    bool candidate_strict;          // Strict 1-frame tone pair passing all 7 criteria
+    char candidate_char;            // Tone pair character, e.g. '1', '*', or '\0'
+    char confirmed_digit;           // Debounced confirmed digit, or '\0'
+    DtmfRejectReason reject_reason; // Reason for rejection, or None if candidate_strict
+};
+
+class DTMFDetector
+{
 public:
     DTMFDetector();
 
@@ -44,7 +63,7 @@ public:
 
     /**
      * @brief Process a single 20 ms frame (160 samples at 8 kHz).
-     * @return DtmfFrameResult containing candidate and confirmed digit info.
+     * @return DtmfFrameResult containing candidate, strict candidate, and confirmed digit info.
      */
     DtmfFrameResult process_frame(const int16_t *samples);
 
@@ -68,7 +87,15 @@ private:
     char m_last_digit;
     uint32_t m_digit_count;
 
-    static const float DTMF_COEFFS[8];
+    // Temporal stability tracking for strict criteria
+    bool m_prev_strict;
+    int m_prev_row_best;
+    int m_prev_col_best;
+    int64_t m_prev_row_max;
+    int64_t m_prev_col_max;
+
+    static const int32_t DTMF_COEFFS_Q14[8];
+    static const int32_t ROW_HARM2_COEFFS_Q14[4];
     static const char DTMF_MAP[4][4];
 };
 

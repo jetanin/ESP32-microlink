@@ -76,4 +76,5 @@ bool dtmf_controller_is_playing_feedback();
 const char* dtmf_controller_get_buffer();
 const char* dtmf_controller_get_last_command();
 bool dtmf_controller_in_progress();
+void dtmf_controller_clear_buffer();
 

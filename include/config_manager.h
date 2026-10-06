@@ -24,7 +24,7 @@ struct ConfigData
     char proxy_host[64];
     uint16_t proxy_port;
     char proxy_password[32];
-    uint8_t vox_pre; // VOX pre-roll delay in frames (0..6, default 3 = 60 ms)
+    uint8_t vox_pre; // VOX pre-roll delay in frames (0..6, default 4 = 80 ms)
 };
 
 void config_manager_init();

@@ -187,6 +187,11 @@ void setup()
     ConfigData cfg = config_manager_get();
     s_pipeline.set_vox_preroll_delay(cfg.vox_pre);
     Serial.printf("VOX pre-roll: %u frames (%u ms)\n", cfg.vox_pre, (unsigned int)(cfg.vox_pre * 20));
+    if (cfg.vox_pre < DtmfGate::PRE_ROLL_N_FRAMES)
+    {
+        Serial.printf("[VOX] WARNING: vox_pre (%u frames) < %u frames (80 ms). Tone leakage may occur during DTMF detection onset!\n",
+                      cfg.vox_pre, DtmfGate::PRE_ROLL_N_FRAMES);
+    }
     // Sync initial mode to system state (must be after system_state_init)
     system_state_set_mode((uint8_t)s_op_mode, s_current_sensitivity);
 

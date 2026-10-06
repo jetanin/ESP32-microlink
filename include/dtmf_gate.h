@@ -5,6 +5,8 @@
 #include <stdbool.h>
 #include <string.h>
 
+void dtmf_controller_clear_buffer();
+
 /**
  * @struct DtmfStats
  * @brief Runtime diagnostics counters since boot for DTMF detection and VOX gating.
@@ -21,30 +23,46 @@ struct DtmfStats
 };
 
 /**
+ * @enum DtmfGateState
+ * @brief 4-State DTMF Gate state machine coordinating VOX inhibition and speech talk-off immunity.
+ */
+enum class DtmfGateState : uint8_t
+{
+    None = 0,        // Normal speech/quiescent state (VOX allowed)
+    CandidateStrict, // Frame 1 strict candidate (purely internal detector state, VOX unaffected!)
+    TonePresent,     // >= 2 consecutive strict frames (~40 ms; VOX force-closed, inhibited, pre-roll erased)
+    ConfirmedDigit   // Debounced confirmed digit delivered
+};
+
+/**
  * @class DtmfGate
  * @brief Pure C++ gate logic coordinating DTMF detection, command sessions, and VOX inhibition.
  *
- * Requirements:
- * - Runs every 20 ms frame in the audio capture task.
- * - Integer-only arithmetic, constant-time execution, no dynamic allocation, host testable.
- * - Wraparound-safe time arithmetic: (uint32_t)(now - t0) >= duration.
- * - Closes VOX immediately when a DTMF tone candidate is detected (no waiting for hang or attack time).
- * - Manages a 1.5 s command session so inter-digit pauses do not reopen VOX.
+ * Rules:
+ * 1. Single-frame candidate (CandidateStrict) does NOT affect VOX or TX in any way.
+ * 2. Sustained tone (TonePresent, >= 2 frames) force-closes VOX, asserts vox_inhibit,
+ *    mutes TX audio, and retroactively erases N=4 frames in the pre-roll delay line.
+ * 3. Only '*' starts a command session. Unconfirmed/isolated digits outside session are dropped.
+ * 4. Constant-time execution, integer-only time arithmetic, host testable.
  */
 class DtmfGate
 {
 public:
+    static constexpr uint8_t PRE_ROLL_N_FRAMES = 4;      // Window (1) + Confirm (2) + Margin (1) = 4 frames (80 ms)
     static constexpr uint32_t SESSION_TIMEOUT_MS = 1500; // Command session timeout after last tone
-    static constexpr uint32_t CANDIDATE_GUARD_MS = 100;  // Guard time after tone candidate ends
+    static constexpr uint32_t GUARD_TIME_MS = 40;        // Guard time after tone ends (2 frames = 40 ms)
 
     DtmfGate()
-        : m_session_active(false),
+        : m_state(DtmfGateState::None),
+          m_session_active(false),
+          m_consecutive_strict(0),
+          m_consecutive_absent(0),
+          m_tone_end_time_ms(0),
           m_last_tone_time_ms(0),
-          m_candidate_end_time_ms(0),
-          m_prev_candidate(false),
           m_force_close_vox(false),
           m_vox_inhibit(false),
           m_mute_tx(false),
+          m_erase_preroll(false),
           m_debug_enabled(false),
           m_stats{0, 0, 0, 0, 0, 0, {0}}
     {
@@ -55,17 +73,20 @@ public:
      */
     void reset()
     {
+        m_state = DtmfGateState::None;
         m_session_active = false;
+        m_consecutive_strict = 0;
+        m_consecutive_absent = 0;
+        m_tone_end_time_ms = 0;
         m_last_tone_time_ms = 0;
-        m_candidate_end_time_ms = 0;
-        m_prev_candidate = false;
         m_force_close_vox = false;
         m_vox_inhibit = false;
         m_mute_tx = false;
+        m_erase_preroll = false;
     }
 
     /**
-     * @brief Explicitly terminate active command session (e.g. on '#', invalid key, or command execution).
+     * @brief Explicitly terminate active command session.
      */
     void end_session()
     {
@@ -75,101 +96,133 @@ public:
     /**
      * @brief Update gate logic on each captured 20 ms frame.
      *
-     * @param candidate          True if a 1-frame DTMF tone pair is present.
-     * @param confirmed_digit    Confirmed debounced digit character, or '\0' if none.
+     * @param candidate_strict   True if frame passed all 7 strict DTMF criteria.
+     * @param confirmed_digit    Debounced confirmed digit character, or '\0' if none.
      * @param parser_in_progress True if the command parser currently has buffered digits.
      * @param now_ms             Current timestamp in milliseconds.
      */
-    void update(bool candidate, char confirmed_digit, bool parser_in_progress, uint32_t now_ms)
+    void update(bool candidate_strict, char confirmed_digit, bool parser_in_progress, uint32_t now_ms)
     {
         m_stats.frames_analyzed++;
 
-        if (candidate)
+            if (candidate_strict)
+            {
+                m_stats.candidate_frames++;
+                m_consecutive_strict++;
+                m_consecutive_absent = 0;
+                m_last_tone_time_ms = now_ms;
+            }
+            else
+            {
+                m_consecutive_absent++;
+                m_consecutive_strict = 0;
+            }
+
+        // State Machine transitions:
+        // State 0 -> State 1: candidateStrict (Frame 1)
+        // Rule 1: A single-frame candidate must NOT affect VOX or transmit audio in any way!
+        if (m_consecutive_strict == 1)
         {
-            m_stats.candidate_frames++;
-            m_last_tone_time_ms = now_ms;
-            m_candidate_end_time_ms = now_ms;
+            m_state = DtmfGateState::CandidateStrict;
+        }
+        // State 1 -> State 2: TonePresent (>= 2 consecutive strict frames)
+        // Rule 2: Force-close VOX, assert vox_inhibit, mute TX, and retroactively erase pre-roll
+        else if (m_consecutive_strict >= 2)
+        {
+            m_state = DtmfGateState::TonePresent;
+        }
+        // Tone absent for >= 2 consecutive frames: exit TonePresent / ConfirmedDigit
+        else if (m_consecutive_absent >= 2)
+        {
+            if (m_state != DtmfGateState::None)
+            {
+                m_tone_end_time_ms = now_ms;
+                m_state = DtmfGateState::None;
+            }
         }
 
+        // Pulse force_close_vox and erase pre-roll on TonePresent rising edge (frame 2)
+        bool rising_tone_present = (m_consecutive_strict == 2);
+        m_force_close_vox = rising_tone_present;
+        if (rising_tone_present)
+        {
+            m_erase_preroll = true;
+            m_stats.vox_force_closes++;
+        }
+
+        // Confirmed digit handling
         if (confirmed_digit != '\0')
         {
             m_stats.confirmed_digits++;
             m_last_tone_time_ms = now_ms;
+            m_state = DtmfGateState::ConfirmedDigit;
 
+            // Rule 3: Only '*' starts a session. Outside session, non-'*' are dropped!
             if (confirmed_digit == '*')
             {
-                // Command session begins on confirmed '*'
                 m_session_active = true;
             }
             else if (m_session_active)
             {
                 if (confirmed_digit == '#')
                 {
-                    // Command sequence complete
                     m_session_active = false;
                 }
-                else if (is_valid_dtmf_char(confirmed_digit))
+                else if (!is_valid_dtmf_char(confirmed_digit))
                 {
-                    // Valid alphanumeric DTMF continuation ('0'-'9', 'A'-'D')
-                }
-                else
-                {
-                    // Invalid/unexpected digit terminates session
                     m_session_active = false;
                     record_command_rejected("invalid_key");
                 }
             }
         }
 
-        // Session timeout: 1.5 s with no new tone
+        // Session timeout (1.5 s after last tone)
         if (m_session_active)
         {
             if ((uint32_t)(now_ms - m_last_tone_time_ms) >= SESSION_TIMEOUT_MS)
             {
                 m_session_active = false;
-            }
-            // If parser has already been cleared or reset externally and candidate has cleared
-            if (!parser_in_progress && (confirmed_digit == '\0') && !candidate &&
-                ((uint32_t)(now_ms - m_candidate_end_time_ms) >= CANDIDATE_GUARD_MS))
-            {
-                m_session_active = false;
+                dtmf_controller_clear_buffer();
             }
         }
 
-        // Guard window: 100 ms after tone ends to prevent VOX re-opening on speech echo / edge
-        bool candidate_guard_active = !candidate &&
-                                      ((uint32_t)(now_ms - m_candidate_end_time_ms) < CANDIDATE_GUARD_MS);
+        // Guard time (40 ms = 2 frames) after tone ends
+        bool in_guard = (m_tone_end_time_ms > 0) &&
+                        (m_state == DtmfGateState::None) &&
+                        ((uint32_t)(now_ms - m_tone_end_time_ms) < GUARD_TIME_MS);
 
-        bool tone_active_or_guarded = candidate || candidate_guard_active;
+        bool tone_active = (m_state == DtmfGateState::TonePresent || m_state == DtmfGateState::ConfirmedDigit);
+        m_vox_inhibit = tone_active || m_session_active || parser_in_progress || in_guard;
+        m_mute_tx = tone_active || in_guard;
+    }
 
-        // VOX is inhibited and TX is muted whenever a tone is present, within guard window, or during session
-        m_vox_inhibit = tone_active_or_guarded || m_session_active || parser_in_progress;
-        m_mute_tx = m_vox_inhibit;
-
-        // Force close VOX if tone is active or session is active
-        m_force_close_vox = m_vox_inhibit;
-
-        if (m_force_close_vox && (candidate && !m_prev_candidate))
-        {
-            m_stats.vox_force_closes++;
-        }
-
-        m_prev_candidate = candidate;
+    /**
+     * @brief Determine if confirmed digit should be delivered to the command parser.
+     * Rule 3: Only '*' starts a session. Digits outside session that are not '*' are dropped.
+     */
+    char get_digit_for_parser(char confirmed_digit) const
+    {
+        if (confirmed_digit == '\0')
+            return '\0';
+        if (confirmed_digit == '*')
+            return '*';
+        if (confirmed_digit == '#')
+            return '#';
+        if (m_session_active)
+            return confirmed_digit;
+        return '\0'; // Dropped outside session
     }
 
     bool should_force_close_vox() const { return m_force_close_vox; }
+    void clear_force_close_vox() { m_force_close_vox = false; }
     bool is_vox_inhibited() const { return m_vox_inhibit; }
     bool should_mute_tx() const { return m_mute_tx; }
     bool is_session_active() const { return m_session_active; }
 
-    /**
-     * @brief Check whether candidate has a rising edge this frame.
-     * Used to mute the pre-roll delay line so the onset of the tone is not transmitted.
-     */
-    bool is_candidate_rising(bool candidate) const
-    {
-        return candidate && !m_prev_candidate;
-    }
+    bool should_erase_preroll() const { return m_erase_preroll; }
+    void clear_erase_preroll() { m_erase_preroll = false; }
+
+    DtmfGateState get_state() const { return m_state; }
 
     // Diagnostics & stats
     const DtmfStats &get_stats() const { return m_stats; }
@@ -199,14 +252,17 @@ private:
         return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'D') || c == '*' || c == '#';
     }
 
+    DtmfGateState m_state;
     bool m_session_active;
+    uint8_t m_consecutive_strict;
+    uint8_t m_consecutive_absent;
+    uint32_t m_tone_end_time_ms;
     uint32_t m_last_tone_time_ms;
-    uint32_t m_candidate_end_time_ms;
-    bool m_prev_candidate;
 
     bool m_force_close_vox;
     bool m_vox_inhibit;
     bool m_mute_tx;
+    bool m_erase_preroll;
 
     bool m_debug_enabled;
     DtmfStats m_stats;

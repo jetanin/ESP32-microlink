@@ -205,8 +205,10 @@ void AudioPipeline::request_vox_reset()
 
 bool AudioPipeline::tx_fifo_write(const int16_t *samples, size_t count)
 {
-    if (!samples || count == 0) return true;
-    if (!m_tx_fifo_mutex || xSemaphoreTake(m_tx_fifo_mutex, pdMS_TO_TICKS(10)) != pdTRUE) return false;
+    if (!samples || count == 0)
+        return true;
+    if (!m_tx_fifo_mutex || xSemaphoreTake(m_tx_fifo_mutex, pdMS_TO_TICKS(10)) != pdTRUE)
+        return false;
 
     if (TX_FIFO_CAPACITY - m_tx_fifo_count < count)
     {
@@ -227,8 +229,10 @@ bool AudioPipeline::tx_fifo_write(const int16_t *samples, size_t count)
 
 size_t AudioPipeline::tx_fifo_read(int16_t *dest, size_t count)
 {
-    if (!dest || count == 0) return 0;
-    if (!m_tx_fifo_mutex || xSemaphoreTake(m_tx_fifo_mutex, pdMS_TO_TICKS(10)) != pdTRUE) return 0;
+    if (!dest || count == 0)
+        return 0;
+    if (!m_tx_fifo_mutex || xSemaphoreTake(m_tx_fifo_mutex, pdMS_TO_TICKS(10)) != pdTRUE)
+        return 0;
 
     size_t to_read = (count < m_tx_fifo_count) ? count : m_tx_fifo_count;
     for (size_t i = 0; i < to_read; ++i)
@@ -350,43 +354,47 @@ void AudioPipeline::audio_capture_task(void *pvParameters)
                 //    VOX state, TX state, and mode (PTT/VOX).
                 DtmfFrameResult res = dtmf_detector_process_frame(mic_frame);
 
-                // 2. Dispatch confirmed digits to DTMF controller immediately
-                //    (inhibit only if local speaker is playing an announcement to avoid acoustic feedback)
-                if (res.confirmed_digit != '\0')
+                    // 2. Update DtmfGate with strict candidate and confirmed digit
+                    s_dtmf_gate.update(res.candidate_strict, res.confirmed_digit, dtmf_controller_in_progress(), now);
+
+                // 3. Retroactively erase N=4 frames in pre-roll buffer on TonePresent onset
+                //    so leading edges of the tone never reach the air.
+                if (s_dtmf_gate.should_erase_preroll())
+                {
+                    pipeline->m_vox_pre_roll.muteRecentFrames(DtmfGate::PRE_ROLL_N_FRAMES);
+                    s_dtmf_gate.clear_erase_preroll();
+                }
+
+                // 4. Dispatch confirmed digits to DTMF controller ONLY if allowed by gate ('*' or active session)
+                char parser_digit = s_dtmf_gate.get_digit_for_parser(res.confirmed_digit);
+                if (parser_digit != '\0')
                 {
                     if (!announcer_is_vox_inhibited())
                     {
-                        dtmf_controller_handle_digit(res.confirmed_digit);
+                        dtmf_controller_handle_digit(parser_digit);
                     }
                 }
 
-                // 3. Update DtmfGate with per-frame candidate and confirmed digit
-                s_dtmf_gate.update(res.candidate, res.confirmed_digit, dtmf_controller_in_progress(), now);
-
-                // Rising edge of candidate: zero newest 2 frames in pre-roll buffer
-                // so the onset of the tone buffered before detection does not leak into TX.
-                if (s_dtmf_gate.is_candidate_rising(res.candidate))
-                {
-                    pipeline->m_vox_pre_roll.muteRecentFrames(2);
-                }
-
-                // Periodic or on-event debug logging if enabled
-                if (s_dtmf_gate.is_debug() && (res.candidate || res.confirmed_digit != '\0'))
-                {
+                    // 5. Periodic or on-event debug logging if enabled
+                    if (s_dtmf_gate.is_debug() && (res.candidate_strict || res.confirmed_digit != '\0' || res.reject_reason != DtmfRejectReason::EnergyLow))
+                    {
                     SystemState st_dbg = system_state_get();
-                    Serial.printf("[dtmf] cand=%d conf=%d digit=%c tx=%d vox=%d pp=%u\n",
-                                  res.candidate ? 1 : 0,
-                                  res.confirmed_digit != '\0' ? 1 : 0,
-                                  res.confirmed_digit != '\0' ? res.confirmed_digit : '-',
-                                  st_dbg.tx_active ? 1 : 0,
-                                  (st_dbg.op_mode == 1) ? 1 : 0,
-                                  (unsigned int)pipeline->m_vox_pre_roll.getBufferedCount());
+                                  Serial.printf("[dtmf] strict=%d conf=%d dig=%c rej=%s tx=%d vox=%d gate=%d sess=%d\n",
+                                                res.candidate_strict ? 1 : 0,
+                                                res.confirmed_digit != '\0' ? 1 : 0,
+                                                res.confirmed_digit != '\0' ? res.confirmed_digit : (res.candidate_char != '\0' ? res.candidate_char : '-'),
+                                                dtmf_reject_reason_str(res.reject_reason),
+                                                st_dbg.tx_active ? 1 : 0,
+                                                (st_dbg.op_mode == 1) ? 1 : 0,
+                                  (int)s_dtmf_gate.get_state(),
+                                  s_dtmf_gate.is_session_active() ? 1 : 0);
                 }
 
-                // Rule 2: Force-close VOX immediately on tone detection (no hang or attack wait)
+                // 6. Rule 2: Force-close VOX immediately on sustained tone detection (TonePresent)
                 if (s_dtmf_gate.should_force_close_vox())
                 {
                     pipeline->force_close_vox();
+                    s_dtmf_gate.clear_force_close_vox();
                 }
 
                 SystemState st = system_state_get();
@@ -407,8 +415,10 @@ void AudioPipeline::audio_capture_task(void *pvParameters)
                     {
                         uint16_t moving_rms = pipeline->m_audio_in.get_moving_rms();
                         uint8_t sens = st.vox_sensitivity;
-                        if (sens < 1) sens = 1;
-                        if (sens > 20) sens = 20;
+                        if (sens < 1)
+                            sens = 1;
+                        if (sens > 20)
+                            sens = 20;
                         uint16_t threshold = VOX_THRESHOLDS[sens];
                         bool voice_active = (moving_rms >= threshold);
 
@@ -459,7 +469,7 @@ void AudioPipeline::audio_capture_task(void *pvParameters)
                     tx_active = echolink_client_is_tx_active();
                     tx_src = echolink_client_get_tx_source();
 
-                    if (tx_active && (tx_src == TxSource::VOX))
+                    if (tx_active && (tx_src == TxSource::VOX || tx_src == TxSource::PTT_BUTTON))
                     {
                         // Once VOX is open, write delayed frame to TX FIFO (skip if not primed yet)
                         if (primed)
@@ -573,5 +583,3 @@ void audio_pipeline_reset_vox()
     if (AudioPipeline::instance())
         AudioPipeline::instance()->reset_vox();
 }
-
-

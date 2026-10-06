@@ -142,22 +142,39 @@ Send DTMF tones from your transceiver to control the node:
 | `*1` + node + `#` | Connect to EchoLink node     | `add <node>` / `connect <node>` |
 | `*2` + node + `#` | Disconnect one station       | `drop <node>`                |
 | `*0#`             | Disconnect all               | `dropall`                    |
+| `#`               | Disconnect current station   | `drop` / `disconnect`        |
 | `*9#`             | Announce status (beep tones) | `status`                     |
 
 ### DTMF & VOX Coexistence (`DtmfGate`)
 
-In VOX mode, pressing DTMF keys near the microphone would normally open VOX and transmit loud DTMF tones over EchoLink. ESP32-MicroLink solves this with a dedicated, zero-allocation gate (`DtmfGate`) enforcing two invariable rules:
+In VOX mode, spoken words containing long open vowels (such as Thai words "สาม" /saam/ or "ห้า" /haa/) have formant energies that overlap DTMF frequencies. Without strict discrimination, speech harmonics can trigger false DTMF candidates ("talk-off"), muting speech or accidentally terminating VOX.
 
-1. **Rule 1 — Detector Invariance:** The Goertzel DTMF detector runs unconditionally on **every** captured 20 ms mic frame (`AUDIO_FRAME_SAMPLES = 160`), before any gain, delay, mute, or VOX gating. Nothing can bypass or pause detection because VOX is open, TX is active, or hang time is running.
-2. **Rule 2 — Immediate VOX Force-Close:** On detection of a DTMF tone candidate, VOX is force-closed **immediately** on that exact frame. There is no waiting for the 600 ms hang timer or the 40 ms attack confirmation timer. If VOX was actively holding TX, it releases TX instantly.
+ESP32-MicroLink features an **Integer Q14/Q15 Goertzel Detector** with **7 Strict Anti-Talk-Off Criteria** coupled with a dedicated **4-State `DtmfGate` Machine** (100% fixed-point integer arithmetic, zero float, zero heap allocation):
 
-### Audio Muting & Anti-Leak Pipeline
+#### 7 Strict Anti-Talk-Off Criteria
+1. **Absolute Energy Floor:** Both low-group (`row_max`) and high-group (`col_max`) Goertzel power values must exceed minimum noise floors.
+2. **Low-Group Dominance:** The strongest low-group bin must exceed the second-strongest bin by $\ge 8.0\times$ (~9 dB) to reject vowel harmonic combs.
+3. **High-Group Dominance:** The strongest high-group bin must exceed the second-strongest bin by $\ge 8.0\times$ (~9 dB).
+4. **Telecom Twist Limit:** Ratio between low and high tone power must remain within $\pm 10\text{ dB}$ ($10\times$ power ratio).
+5. **Low-Group 2nd Harmonic Suppression:** Speech vowels possess strong 2nd harmonics. The detector calculates the 2nd harmonic bin of the detected low tone (subtracting high-group sidelobe leakage) and requires $P_{\text{low}} \ge 10 \times P_{2\text{nd}}$.
+6. **Tone Pair Energy Ratio:** A valid DTMF pair concentrates energy in two pure sinusoids, whereas voice spreads energy across many frequencies. Requires $(P_{\text{low}} + P_{\text{high}}) \ge 80\%$ of total frame energy (normalized: $\ge 45 \times E_{\text{total}}$).
+7. **Temporal Stability:** Consecutive frames must match the exact same low and high frequency bins, and tone power must remain within $4\times$ between frames.
 
-- **Pre-Roll Delay Line Muting:** Because tone recognition requires ~40 ms (2 frames) to confirm, a tone onset could theoretically slip into the pre-roll delay line before confirmation. On every tone candidate rising edge ($0 \rightarrow 1$), `m_vox_pre_roll.muteRecentFrames(2)` zeroes the preceding 40 ms in the buffer so **zero DTMF tone leaks into the VoIP stream**.
-- **100 ms Candidate Guard:** When a tone candidate ends, VOX remains inhibited for an extra 100 ms to bridge tone wobble and inter-digit transitions.
-- **1.5-Second Command Session:** Dialing `*` opens an active command session (`SESSION_TIMEOUT_MS = 1500`). VOX is kept strictly closed across pauses between digits until the command is completed with `#` or times out.
-- **PTT Override & TX Audio Blanking:** If the operator presses DTMF while the hardware PTT button is held down, PTT transmission remains keyed, but the microphone audio is replaced with digital silence (`0`) so control tones are never transmitted over RF/VoIP.
-- **Debounce Protection:** Single authoritative dispatcher, $\ge 60\text{ ms}$ pause re-arming, and a 100 ms rapid identical-digit filter prevent key bounce and duplicate digits.
+#### 4-State Gate State Machine (`DtmfGate`)
+- **State 0 (`None`):** Quiescent / normal voice speech. VOX operates unrestricted.
+- **State 1 (`CandidateStrict`):** A single 20 ms frame passes all 7 strict criteria.
+  - **Rule 1 — Candidate Invariance:** A single-frame candidate **never** affects VOX or transmit audio in any way. Speech vowels passing a momentary frame never cut off VOX.
+- **State 2 (`TonePresent`):** Strict criteria hold for $\ge 2$ consecutive frames (~40 ms).
+  - **Rule 2 — Immediate VOX Force-Close & Muting:** On rising edge, fires a 1-frame pulse that force-closes VOX immediately, asserts `vox_inhibit`, mutes TX audio, and retroactively erases $N=4$ frames (80 ms) in the pre-roll buffer so zero tone onset leaks into VoIP.
+- **State 3 (`ConfirmedDigit`):** Debounced digit confirmed ($\ge 2$ consecutive hits with pause re-arming) and dispatched to the command controller.
+
+#### Audio Muting & Anti-Leak Pipeline
+- **Pre-Roll Delay Line Muting:** When `TonePresent` fires, `m_vox_pre_roll.muteRecentFrames(4)` zeroes the preceding 80 ms in the pre-roll buffer so **zero DTMF tone leaks into the VoIP stream**.
+- **40 ms Guard Window:** When a tone ends, VOX remains inhibited for 40 ms (2 frames) to bridge tone decay and prevent voice edge re-triggering.
+- **1.5-Second Command Session:** Dialing `*` opens an active command session (`SESSION_TIMEOUT_MS = 1500`). VOX is kept strictly inhibited across pauses between digits until the command is completed with `#` or times out.
+- **Outside Session Dropping:** Unconfirmed or isolated digits outside a command session (other than `*` or `#`) are dropped to protect against accidental talk-off keying.
+- **PTT Override & Blanking:** Hardware PTT button is fully supported in both PTT and VOX modes. While PTT is held, any DTMF tone replaces mic audio with digital silence (`0`) so control tones are never transmitted over RF/VoIP.
+- **Diagnostics & Live Debugging:** Live per-frame rejection reasons (`EnergyLow`, `LowDominance`, `HighDominance`, `Twist`, `Harm2`, `EnergyRatio`, `FreqInstability`, `AmpInstability`) can be monitored via `dtmf debug on` and `dtmf stats`.
 
 ---
 
@@ -171,7 +188,7 @@ The transmit mode is selected with the mode switch on GPIO 23:
 | Open (HIGH)     | **PTT** | PTT button (GPIO 2) held down                    |
 
 - **PTT mode:** Only the PTT button keys the transmitter. The microphone level and the potentiometer are ignored. Audio bypasses the pre-roll buffer completely with **0 ms added latency**.
-- **VOX mode:** The PTT button is ignored. Voice detection uses a **4-frame (80 ms) moving RMS energy window** to reject short acoustic clicks, pops, and spikes.
+- **VOX mode:** Transmit keys automatically when speech is detected. The hardware PTT button also functions as an immediate manual override keying TX without needing to flip the mode switch. Voice detection uses a **4-frame (80 ms) moving RMS energy window** to reject short acoustic clicks, pops, and spikes.
   - **Sensitivity adjustment:** Managed via the potentiometer on GPIO 3 across **20 discrete logarithmic sensitivity steps** (`VOX_THRESHOLDS[1..20]`). Turning clockwise makes VOX more sensitive.
   - **Attack & Hang timers:** Requires **40 ms attack confirmation** (signal sustained above threshold) to open TX, and maintains a **400 ms hang timer** to bridge pauses between words without chopping.
 - **VOX Pre-Roll Buffer (Audio Delay Line):**
@@ -331,10 +348,16 @@ ESP32-microlink/
 │   ├── system_state.cpp       # Shared state (mutex-protected)
 │   ├── echolink_proxy.cpp     # EchoLink proxy protocol
 ├── include/                   # Header files (dtmf_gate.h, vox_pre_roll.h, link_led.h)
-├── test/                      # Unit test suites (test_dtmf_gate.cpp, test_vox_pre_roll.cpp, test_link_led.cpp)
+├── test/                      # Unit test suites
+│   ├── test_dtmf_gate.cpp             # DTMF gate unit tests
+│   ├── test_vox_pre_roll.cpp          # VOX pre-roll buffer unit tests
+│   ├── test_link_led.cpp              # Link LED state machine tests
+│   ├── test_phase1_baseline.cpp       # Synthetic DTMF & speech talk-off baseline tests
+│   └── test_phase2_verification.cpp   # Phase 2 gate & talk-off verification tests
 ├── data/                      # LittleFS web UI files (HTML/CSS/JS)
 ├── lib/gsm0610/               # GSM 06.10 codec library
 ├── tools/
+│   ├── dtmf_wav_test.cpp      # Standalone WAV file test runner for DTMF talk-off analysis
 │   └── make_voice.sh          # Script to generate TTS voice prompts (optional)
 └── platformio.ini
 ```

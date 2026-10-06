@@ -61,11 +61,11 @@ void DTMFController::handle_digit(char digit)
         return;
     }
 
-    if (m_buf_len > 0 && m_buffer[0] == '*')
+    if (digit == '#')
     {
-        if (digit == '#')
+        if (m_buf_len > 0 && m_buffer[0] == '*')
         {
-            // End of DTMF command sequence
+            // End of DTMF command sequence (e.g. *9#, *0#, *19999#)
             m_buffer[m_buf_len] = '#';
             m_buffer[m_buf_len + 1] = '\0';
             m_buf_len++;
@@ -74,7 +74,19 @@ void DTMFController::handle_digit(char digit)
             handle_command(m_buffer);
             clear_buffer();
         }
-        else if (isdigit((unsigned char)digit) || (digit >= 'A' && digit <= 'D'))
+        else
+        {
+            // Standalone '#' -> standard EchoLink disconnect command
+            Serial.println(F("[DTMF] Standalone '#' received: Disconnect"));
+            handle_command("#");
+            clear_buffer();
+        }
+        return;
+    }
+
+    if (m_buf_len > 0 && m_buffer[0] == '*')
+    {
+        if (isdigit((unsigned char)digit) || (digit >= 'A' && digit <= 'D'))
         {
             if (m_buf_len < sizeof(m_buffer) - 2)
             {
@@ -114,8 +126,8 @@ bool DTMFController::handle_command(const char *command_str)
     parsed.action = DTMFActionType::NONE;
     strncpy(parsed.raw_code, p, sizeof(parsed.raw_code) - 1);
 
-    // 1. Check *0# or "dropall" (Disconnect all)
-    if (strcmp(p, "*0#") == 0 || strcasecmp(p, "dropall") == 0 || strcasecmp(p, "disconnect all") == 0)
+    // 1. Check *0# or "#" or "dropall" (Disconnect all)
+    if (strcmp(p, "*0#") == 0 || strcmp(p, "#") == 0 || strcasecmp(p, "dropall") == 0 || strcasecmp(p, "disconnect all") == 0 || strcasecmp(p, "disconnect") == 0)
     {
         parsed.action = DTMFActionType::DISCONNECT_ALL;
     }
@@ -360,5 +372,10 @@ bool dtmf_controller_in_progress()
 {
     const char *buf = dtmf_controller_get_buffer();
     return (buf && buf[0] != '\0');
+}
+
+void dtmf_controller_clear_buffer()
+{
+    s_controller.clear_buffer();
 }
 

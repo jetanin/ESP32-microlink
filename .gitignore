@@ -89,3 +89,25 @@ $RECYCLE.BIN/
 *.tmp
 *.orig
 *.log
+
+# Audio Captures, Test Dumps & Media Files
+*.wav
+*.pcm
+*.raw
+*.m4a
+*.mp3
+*.aac
+*.ogg
+
+# Python virtual environments & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Crash dumps & Core files
+core
+core.*
+*.dmp
